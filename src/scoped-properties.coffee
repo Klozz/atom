@@ -3,20 +3,21 @@ CSON = require 'season'
 
 module.exports =
 class ScopedProperties
-  @load: (scopedPropertiesPath, callback) ->
+  @load: (scopedPropertiesPath, config, callback) ->
     CSON.readFile scopedPropertiesPath, (error, scopedProperties={}) ->
       if error?
         callback(error)
       else
-        callback(null, new ScopedProperties(scopedPropertiesPath, scopedProperties))
+        callback(null, new ScopedProperties(scopedPropertiesPath, scopedProperties, config))
 
-  constructor: (@path, @scopedProperties) ->
-    @propertyDisposable = new CompositeDisposable
+  constructor: (@path, @scopedProperties, @config) ->
 
   activate: ->
     for selector, properties of @scopedProperties
-      @propertyDisposable.add atom.config.addScopedSettings(@path, selector, properties)
+      @config.set(null, properties, scopeSelector: selector, source: @path)
     return
 
   deactivate: ->
-    @propertyDisposable.dispose()
+    for selector of @scopedProperties
+      @config.unset(null, scopeSelector: selector, source: @path)
+    return

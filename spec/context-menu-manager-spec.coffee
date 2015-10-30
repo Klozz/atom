@@ -1,5 +1,3 @@
-{$$} = require 'atom'
-
 ContextMenuManager = require '../src/context-menu-manager'
 
 describe "ContextMenuManager", ->
@@ -7,7 +5,7 @@ describe "ContextMenuManager", ->
 
   beforeEach ->
     {resourcePath} = atom.getLoadSettings()
-    contextMenu = new ContextMenuManager({resourcePath})
+    contextMenu = new ContextMenuManager({resourcePath, keymapManager: atom.keymaps})
 
     parent = document.createElement("div")
     child = document.createElement("div")
@@ -151,24 +149,10 @@ describe "ContextMenuManager", ->
       shouldDisplay = false
       expect(contextMenu.templateForEvent(dispatchedEvent)).toEqual []
 
-    it "allows items to be specified in the legacy format for now", ->
-      contextMenu.add '.parent':
-        'A': 'a'
-        'Separator 1': '-'
-        'B':
-          'C': 'c'
-          'Separator 2': '-'
-          'D': 'd'
-
-      expect(contextMenu.templateForElement(parent)).toEqual [
-        {label: 'A', command: 'a'}
-        {type: 'separator'}
-        {
-          label: 'B'
-          submenu: [
-            {label: 'C', command: 'c'}
-            {type: 'separator'}
-            {label: 'D', command: 'd'}
-          ]
-        }
-      ]
+    it "throws an error when the selector is invalid", ->
+      addError = null
+      try
+        contextMenu.add '<>': [{label: 'A', command: 'a'}]
+      catch error
+        addError = error
+      expect(addError.message).toContain('<>')

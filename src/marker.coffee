@@ -1,9 +1,5 @@
-{Range} = require 'text-buffer'
 _ = require 'underscore-plus'
-{Subscriber} = require 'emissary'
-EmitterMixin = require('emissary').Emitter
-{Emitter} = require 'event-kit'
-Grim = require 'grim'
+{CompositeDisposable, Emitter} = require 'event-kit'
 
 # Essential: Represents a buffer annotation that remains logically stationary
 # even as the buffer changes. This is used to represent cursors, folds, snippet
@@ -45,16 +41,13 @@ Grim = require 'grim'
 # See {TextEditor::markBufferRange} for usage.
 module.exports =
 class Marker
-  EmitterMixin.includeInto(this)
-  Subscriber.includeInto(this)
-
   bufferMarkerSubscription: null
   oldHeadBufferPosition: null
   oldHeadScreenPosition: null
   oldTailBufferPosition: null
   oldTailScreenPosition: null
   wasValid: true
-  deferredChangeEvents: null
+  hasChangeObservers: false
 
   ###
   Section: Construction and Destruction
@@ -62,26 +55,31 @@ class Marker
 
   constructor: ({@bufferMarker, @displayBuffer}) ->
     @emitter = new Emitter
+    @disposables = new CompositeDisposable
     @id = @bufferMarker.id
-    @oldHeadBufferPosition = @getHeadBufferPosition()
-    @oldHeadScreenPosition = @getHeadScreenPosition()
-    @oldTailBufferPosition = @getTailBufferPosition()
-    @oldTailScreenPosition = @getTailScreenPosition()
-    @wasValid = @isValid()
 
-    @subscribe @bufferMarker.onDidDestroy => @destroyed()
-    @subscribe @bufferMarker.onDidChange (event) => @notifyObservers(event)
+    @disposables.add @bufferMarker.onDidDestroy => @destroyed()
 
   # Essential: Destroys the marker, causing it to emit the 'destroyed' event. Once
   # destroyed, a marker cannot be restored by undo/redo operations.
   destroy: ->
     @bufferMarker.destroy()
-    @unsubscribe()
+    @disposables.dispose()
 
-  # Essential: Creates and returns a new {Marker} with the same properties as this
-  # marker.
+  # Essential: Creates and returns a new {Marker} with the same properties as
+  # this marker.
   #
-  # * `properties` {Object}
+  # {Selection} markers (markers with a custom property `type: "selection"`)
+  # should be copied with a different `type` value, for example with
+  # `marker.copy({type: null})`. Otherwise, the new marker's selection will
+  # be merged with this marker's selection, and a `null` value will be
+  # returned.
+  #
+  # * `properties` (optional) {Object} properties to associate with the new
+  # marker. The new marker's properties are computed by extending this marker's
+  # properties with `properties`.
+  #
+  # Returns a {Marker}.
   copy: (properties) ->
     @displayBuffer.getMarker(@bufferMarker.copy(properties).id)
 
@@ -93,10 +91,14 @@ class Marker
   #
   # * `callback` {Function} to be called when the marker changes.
   #   * `event` {Object} with the following keys:
-  #     * `oldHeadPosition` {Point} representing the former head position
-  #     * `newHeadPosition` {Point} representing the new head position
-  #     * `oldTailPosition` {Point} representing the former tail position
-  #     * `newTailPosition` {Point} representing the new tail position
+  #     * `oldHeadBufferPosition` {Point} representing the former head buffer position
+  #     * `newHeadBufferPosition` {Point} representing the new head buffer position
+  #     * `oldTailBufferPosition` {Point} representing the former tail buffer position
+  #     * `newTailBufferPosition` {Point} representing the new tail buffer position
+  #     * `oldHeadScreenPosition` {Point} representing the former head screen position
+  #     * `newHeadScreenPosition` {Point} representing the new head screen position
+  #     * `oldTailScreenPosition` {Point} representing the former tail screen position
+  #     * `newTailScreenPosition` {Point} representing the new tail screen position
   #     * `wasValid` {Boolean} indicating whether the marker was valid before the change
   #     * `isValid` {Boolean} indicating whether the marker is now valid
   #     * `hadTail` {Boolean} indicating whether the marker had a tail before the change
@@ -108,6 +110,14 @@ class Marker
   #
   # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
   onDidChange: (callback) ->
+    unless @hasChangeObservers
+      @oldHeadBufferPosition = @getHeadBufferPosition()
+      @oldHeadScreenPosition = @getHeadScreenPosition()
+      @oldTailBufferPosition = @getTailBufferPosition()
+      @oldTailScreenPosition = @getTailScreenPosition()
+      @wasValid = @isValid()
+      @disposables.add @bufferMarker.onDidChange (event) => @notifyObservers(event)
+      @hasChangeObservers = true
     @emitter.on 'did-change', callback
 
   # Essential: Invoke the given callback when the marker is destroyed.
@@ -117,15 +127,6 @@ class Marker
   # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
   onDidDestroy: (callback) ->
     @emitter.on 'did-destroy', callback
-
-  on: (eventName) ->
-    switch eventName
-      when 'changed'
-        Grim.deprecate("Use Marker::onDidChange instead")
-      when 'destroyed'
-        Grim.deprecate("Use Marker::onDidDestroy instead")
-
-    EmitterMixin::on.apply(this, arguments)
 
   ###
   Section: Marker Details
@@ -159,9 +160,6 @@ class Marker
   # the marker.
   getProperties: ->
     @bufferMarker.getProperties()
-  getAttributes: ->
-    Grim.deprecate 'Use Marker::getProperties instead'
-    @getProperties()
 
   # Essential: Merges an {Object} containing new properties into the marker's
   # existing properties.
@@ -169,16 +167,10 @@ class Marker
   # * `properties` {Object}
   setProperties: (properties) ->
     @bufferMarker.setProperties(properties)
-  setAttributes: (properties) ->
-    Grim.deprecate 'Use Marker::getProperties instead'
-    @setProperties(properties)
 
   matchesProperties: (attributes) ->
     attributes = @displayBuffer.translateToBufferMarkerParams(attributes)
     @bufferMarker.matchesParams(attributes)
-  matchesAttributes: (attributes) ->
-    Grim.deprecate 'Use Marker::matchesProperties instead'
-    @matchesProperties(attributes)
 
   ###
   Section: Comparing to other markers
@@ -268,7 +260,7 @@ class Marker
 
   # Extended: Sets the buffer position of the marker's head.
   #
-  # * `screenRange` The new {Point} to use
+  # * `bufferPosition` The new {Point} to use
   # * `properties` (optional) {Object} properties to associate with the marker.
   setHeadBufferPosition: (bufferPosition, properties) ->
     @bufferMarker.setHeadPosition(bufferPosition, properties)
@@ -281,10 +273,9 @@ class Marker
 
   # Extended: Sets the screen position of the marker's head.
   #
-  # * `screenRange` The new {Point} to use
+  # * `screenPosition` The new {Point} to use
   # * `properties` (optional) {Object} properties to associate with the marker.
   setHeadScreenPosition: (screenPosition, properties) ->
-    screenPosition = @displayBuffer.clipScreenPosition(screenPosition, properties)
     @setHeadBufferPosition(@displayBuffer.bufferPositionForScreenPosition(screenPosition, properties))
 
   # Extended: Retrieves the buffer position of the marker's tail.
@@ -295,7 +286,7 @@ class Marker
 
   # Extended: Sets the buffer position of the marker's tail.
   #
-  # * `screenRange` The new {Point} to use
+  # * `bufferPosition` The new {Point} to use
   # * `properties` (optional) {Object} properties to associate with the marker.
   setTailBufferPosition: (bufferPosition) ->
     @bufferMarker.setTailPosition(bufferPosition)
@@ -308,10 +299,9 @@ class Marker
 
   # Extended: Sets the screen position of the marker's tail.
   #
-  # * `screenRange` The new {Point} to use
+  # * `screenPosition` The new {Point} to use
   # * `properties` (optional) {Object} properties to associate with the marker.
   setTailScreenPosition: (screenPosition, options) ->
-    screenPosition = @displayBuffer.clipScreenPosition(screenPosition, options)
     @setTailBufferPosition(@displayBuffer.bufferPositionForScreenPosition(screenPosition, options))
 
   # Extended: Returns a {Boolean} indicating whether the marker has a tail.
@@ -344,7 +334,6 @@ class Marker
 
   destroyed: ->
     delete @displayBuffer.markers[@id]
-    @emit 'destroyed'
     @emitter.emit 'did-destroy'
     @emitter.dispose()
 
@@ -357,11 +346,11 @@ class Marker
     newTailScreenPosition = @getTailScreenPosition()
     isValid = @isValid()
 
-    return if _.isEqual(isValid, @wasValid) and
-      _.isEqual(newHeadBufferPosition, @oldHeadBufferPosition) and
-      _.isEqual(newHeadScreenPosition, @oldHeadScreenPosition) and
-      _.isEqual(newTailBufferPosition, @oldTailBufferPosition) and
-      _.isEqual(newTailScreenPosition, @oldTailScreenPosition)
+    return if isValid is @wasValid and
+      newHeadBufferPosition.isEqual(@oldHeadBufferPosition) and
+      newHeadScreenPosition.isEqual(@oldHeadScreenPosition) and
+      newTailBufferPosition.isEqual(@oldTailBufferPosition) and
+      newTailScreenPosition.isEqual(@oldTailScreenPosition)
 
     changeEvent = {
       @oldHeadScreenPosition, newHeadScreenPosition,
@@ -372,28 +361,10 @@ class Marker
       isValid
     }
 
-    if @deferredChangeEvents?
-      @deferredChangeEvents.push(changeEvent)
-    else
-      @emit 'changed', changeEvent
-      @emitter.emit 'did-change', changeEvent
-
     @oldHeadBufferPosition = newHeadBufferPosition
     @oldHeadScreenPosition = newHeadScreenPosition
     @oldTailBufferPosition = newTailBufferPosition
     @oldTailScreenPosition = newTailScreenPosition
     @wasValid = isValid
 
-  pauseChangeEvents: ->
-    @deferredChangeEvents = []
-
-  resumeChangeEvents: ->
-    if deferredChangeEvents = @deferredChangeEvents
-      @deferredChangeEvents = null
-
-      for event in deferredChangeEvents
-        @emit 'changed', event
-        @emitter.emit 'did-change', event
-
-  getPixelRange: ->
-    @displayBuffer.pixelRangeForScreenRange(@getScreenRange(), false)
+    @emitter.emit 'did-change', changeEvent

@@ -3,6 +3,7 @@ GitRepository = require '../src/git-repository'
 fs = require 'fs-plus'
 path = require 'path'
 Task = require '../src/task'
+Project = require '../src/project'
 
 copyRepository = ->
   workingDirPath = temp.mkdirSync('atom-working-dir')
@@ -123,8 +124,10 @@ describe "GitRepository", ->
     [filePath, editor] = []
 
     beforeEach ->
+      spyOn(atom, "confirm")
+
       workingDirPath = copyRepository()
-      repo = new GitRepository(workingDirPath)
+      repo = new GitRepository(workingDirPath, {project: atom.project, config: atom.config, confirm: atom.confirm})
       filePath = path.join(workingDirPath, 'a.txt')
       fs.writeFileSync(filePath, 'ch ch changes')
 
@@ -132,10 +135,10 @@ describe "GitRepository", ->
         atom.workspace.open(filePath)
 
       runs ->
-        editor = atom.workspace.getActiveEditor()
+        editor = atom.workspace.getActiveTextEditor()
 
     it "displays a confirmation dialog by default", ->
-      spyOn(atom, 'confirm').andCallFake ({buttons}) -> buttons.OK()
+      atom.confirm.andCallFake ({buttons}) -> buttons.OK()
       atom.config.set('editor.confirmCheckoutHeadRevision', true)
 
       repo.checkoutHeadForEditor(editor)
@@ -143,7 +146,6 @@ describe "GitRepository", ->
       expect(fs.readFileSync(filePath, 'utf8')).toBe ''
 
     it "does not display a dialog when confirmation is disabled", ->
-      spyOn(atom, 'confirm')
       atom.config.set('editor.confirmCheckoutHeadRevision', false)
 
       repo.checkoutHeadForEditor(editor)
@@ -259,6 +261,10 @@ describe "GitRepository", ->
       editor.getBuffer().emitter.emit 'did-change-path'
       expect(statusHandler.callCount).toBe 1
 
+    it "stops listening to the buffer when the repository is destroyed (regression)", ->
+      atom.project.getRepositories()[0].destroy()
+      expect(-> editor.save()).not.toThrow()
+
   describe "when a project is deserialized", ->
     [buffer, project2] = []
 
@@ -272,7 +278,8 @@ describe "GitRepository", ->
         atom.workspace.open('file.txt')
 
       runs ->
-        project2 = atom.project.testSerialization()
+        project2 = new Project({notificationManager: atom.notifications, packageManager: atom.packages, confirm: atom.confirm})
+        project2.deserialize(atom.project.serialize(), atom.deserializers)
         buffer = project2.getBuffers()[0]
 
       waitsFor ->

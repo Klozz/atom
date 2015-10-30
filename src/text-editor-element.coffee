@@ -1,206 +1,347 @@
-{View, $} = require 'space-pen'
-React = require 'react-atom-fork'
+{Emitter, CompositeDisposable} = require 'event-kit'
+Path = require 'path'
 {defaults} = require 'underscore-plus'
 TextBuffer = require 'text-buffer'
 TextEditor = require './text-editor'
 TextEditorComponent = require './text-editor-component'
-TextEditorView = null
+StylesElement = require './styles-element'
+
+ShadowStyleSheet = null
 
 class TextEditorElement extends HTMLElement
   model: null
   componentDescriptor: null
   component: null
-  lineOverdrawMargin: null
+  attached: false
+  tileSize: null
   focusOnAttach: false
+  hasTiledRendering: true
+  logicalDisplayBuffer: true
 
   createdCallback: ->
-    @subscriptions =
-    @initializeContent()
-    @createSpacePenShim()
+    # Use globals when the following instance variables aren't set.
+    @config = atom.config
+    @themes = atom.themes
+    @workspace = atom.workspace
+    @assert = atom.assert
+    @views = atom.views
+    @styles = atom.styles
+    @grammars = atom.grammars
+
+    @emitter = new Emitter
+    @subscriptions = new CompositeDisposable
+
     @addEventListener 'focus', @focused.bind(this)
-    @addEventListener 'focusout', @focusedOut.bind(this)
     @addEventListener 'blur', @blurred.bind(this)
 
-  initializeContent: (attributes) ->
-    @classList.add('editor', 'react', 'editor-colors')
+    @classList.add('editor')
     @setAttribute('tabindex', -1)
 
-  createSpacePenShim: ->
-    TextEditorView ?= require './text-editor-view'
-    @__spacePenView = new TextEditorView(this)
+  initializeContent: (attributes) ->
+    if @config.get('editor.useShadowDOM')
+      @useShadowDOM = true
+
+      unless ShadowStyleSheet?
+        ShadowStyleSheet = document.createElement('style')
+        ShadowStyleSheet.textContent = @themes.loadLessStylesheet(require.resolve('../static/text-editor-shadow.less'))
+
+      @createShadowRoot()
+
+      @shadowRoot.appendChild(ShadowStyleSheet.cloneNode(true))
+      @stylesElement = new StylesElement
+      @stylesElement.initialize(@styles)
+      @stylesElement.setAttribute('context', 'atom-text-editor')
+
+      @rootElement = document.createElement('div')
+      @rootElement.classList.add('editor--private')
+
+      @shadowRoot.appendChild(@stylesElement)
+      @shadowRoot.appendChild(@rootElement)
+    else
+      @useShadowDOM = false
+
+      @classList.add('editor', 'editor-colors')
+      @stylesElement = document.head.querySelector('atom-styles')
+      @rootElement = this
 
   attachedCallback: ->
     @buildModel() unless @getModel()?
-    @mountComponent() unless @component?.isMounted()
+    @assert(@model.isAlive(), "Attaching a view for a destroyed editor")
+    @mountComponent() unless @component?
+    @listenForComponentEvents()
     @component.checkForVisibilityChange()
-    @focus() if @focusOnAttach
+    if this is document.activeElement
+      @focused()
+    @emitter.emit("did-attach")
+
+  detachedCallback: ->
+    @unmountComponent()
+    @subscriptions.dispose()
+    @subscriptions = new CompositeDisposable
+    @emitter.emit("did-detach")
+
+  listenForComponentEvents: ->
+    @subscriptions.add @component.onDidChangeScrollTop =>
+      @emitter.emit("did-change-scroll-top", arguments...)
+    @subscriptions.add @component.onDidChangeScrollLeft =>
+      @emitter.emit("did-change-scroll-left", arguments...)
+
+  initialize: (model, {@views, @config, @themes, @workspace, @assert, @styles, @grammars}) ->
+    throw new Error("Must pass a config parameter when initializing TextEditorElements") unless @views?
+    throw new Error("Must pass a config parameter when initializing TextEditorElements") unless @config?
+    throw new Error("Must pass a themes parameter when initializing TextEditorElements") unless @themes?
+    throw new Error("Must pass a workspace parameter when initializing TextEditorElements") unless @workspace?
+    throw new Error("Must pass a assert parameter when initializing TextEditorElements") unless @assert?
+    throw new Error("Must pass a styles parameter when initializing TextEditorElements") unless @styles?
+    throw new Error("Must pass a grammars parameter when initializing TextEditorElements") unless @grammars?
+
+    @setModel(model)
+    this
 
   setModel: (model) ->
     throw new Error("Model already assigned on TextEditorElement") if @model?
+    return if model.isDestroyed()
+
     @model = model
+    @initializeContent()
     @mountComponent()
     @addGrammarScopeAttribute()
+    @addMiniAttribute() if @model.isMini()
+    @addEncodingAttribute()
     @model.onDidChangeGrammar => @addGrammarScopeAttribute()
-    @__spacePenView.setModel(@model)
+    @model.onDidChangeEncoding => @addEncodingAttribute()
+    @model.onDidDestroy => @unmountComponent()
+    @model.onDidChangeMini (mini) => if mini then @addMiniAttribute() else @removeMiniAttribute()
     @model
 
   getModel: ->
     @model ? @buildModel()
 
   buildModel: ->
-    @setModel(new TextEditor(
-      buffer: new TextBuffer
+    @setModel(@workspace.buildTextEditor(
+      buffer: new TextBuffer(@textContent)
       softWrapped: false
       tabLength: 2
       softTabs: true
       mini: @hasAttribute('mini')
+      lineNumberGutterVisible: not @hasAttribute('gutter-hidden')
       placeholderText: @getAttribute('placeholder-text')
     ))
 
   mountComponent: ->
-    @componentDescriptor ?= TextEditorComponent(
-      parentView: this
+    @component = new TextEditorComponent(
+      hostElement: this
+      rootElement: @rootElement
+      stylesElement: @stylesElement
       editor: @model
-      mini: @model.mini
-      lineOverdrawMargin: @lineOverdrawMargin
+      tileSize: @tileSize
+      useShadowDOM: @useShadowDOM
+      views: @views
+      themes: @themes
+      config: @config
+      workspace: @workspace
+      assert: @assert
+      grammars: @grammars
     )
-    @component = React.renderComponent(@componentDescriptor, this)
+    @rootElement.appendChild(@component.getDomNode())
+
+    if @useShadowDOM
+      @shadowRoot.addEventListener('blur', @shadowRootBlurred.bind(this), true)
+    else
+      inputNode = @component.hiddenInputComponent.getDomNode()
+      inputNode.addEventListener 'focus', @focused.bind(this)
+      inputNode.addEventListener 'blur', => @dispatchEvent(new FocusEvent('blur', bubbles: false))
 
   unmountComponent: ->
-    return unless @component?.isMounted()
-    React.unmountComponentAtNode(this)
-    @component = null
+    if @component?
+      @component.destroy()
+      @component.getDomNode().remove()
+      @component = null
 
   focused: ->
-    if @component?
-      @component.onFocus()
-    else
-      @focusOnAttach = true
-
-  focusedOut: (event) ->
-    event.stopImmediatePropagation() if @contains(event.relatedTarget)
+    @component?.focused()
 
   blurred: (event) ->
-    event.stopImmediatePropagation() if @contains(event.relatedTarget)
+    unless @useShadowDOM
+      if event.relatedTarget is @component.hiddenInputComponent.getDomNode()
+        event.stopImmediatePropagation()
+        return
+
+    @component?.blurred()
+
+  # Work around what seems to be a bug in Chromium. Focus can be stolen from the
+  # hidden input when clicking on the gutter and transferred to the
+  # already-focused host element. The host element never gets a 'focus' event
+  # however, which leaves us in a limbo state where the text editor element is
+  # focused but the hidden input isn't focused. This always refocuses the hidden
+  # input if a blur event occurs in the shadow DOM that is transferring focus
+  # back to the host element.
+  shadowRootBlurred: (event) ->
+    @component.focused() if event.relatedTarget is this
 
   addGrammarScopeAttribute: ->
-    grammarScope = @model.getGrammar()?.scopeName?.replace(/\./g, ' ')
-    @setAttribute('data-grammar', grammarScope)
+    @dataset.grammar = @model.getGrammar()?.scopeName?.replace(/\./g, ' ')
+
+  addMiniAttribute: ->
+    @setAttributeNode(document.createAttribute("mini"))
+
+  removeMiniAttribute: ->
+    @removeAttribute("mini")
+
+  addEncodingAttribute: ->
+    @dataset.encoding = @model.getEncoding()
 
   hasFocus: ->
     this is document.activeElement or @contains(document.activeElement)
 
-stopCommandEventPropagation = (commandListeners) ->
-  newCommandListeners = {}
-  for commandName, commandListener of commandListeners
-    do (commandListener) ->
-      newCommandListeners[commandName] = (event) ->
-        event.stopPropagation()
-        commandListener.call(this, event)
-  newCommandListeners
+  setUpdatedSynchronously: (@updatedSynchronously) -> @updatedSynchronously
 
-atom.commands.add '[is=atom-text-editor]', stopCommandEventPropagation(
-  'core:move-left': -> @getModel().moveLeft()
-  'core:move-right': -> @getModel().moveRight()
-  'core:select-left': -> @getModel().selectLeft()
-  'core:select-right': -> @getModel().selectRight()
-  'core:select-all': -> @getModel().selectAll()
-  'core:backspace': -> @getModel().backspace()
-  'core:delete': -> @getModel().delete()
-  'core:undo': -> @getModel().undo()
-  'core:redo': -> @getModel().redo()
-  'core:cut': -> @getModel().cutSelectedText()
-  'core:copy': -> @getModel().copySelectedText()
-  'core:paste': -> @getModel().pasteText()
-  'editor:move-to-previous-word': -> @getModel().moveToPreviousWord()
-  'editor:select-word': -> @getModel().selectWordsContainingCursors()
-  'editor:consolidate-selections': (event) -> event.abortKeyBinding() unless @getModel().consolidateSelections()
-  'editor:delete-to-beginning-of-word': -> @getModel().deleteToBeginningOfWord()
-  'editor:delete-to-beginning-of-line': -> @getModel().deleteToBeginningOfLine()
-  'editor:delete-to-end-of-line': -> @getModel().deleteToEndOfLine()
-  'editor:delete-to-end-of-word': -> @getModel().deleteToEndOfWord()
-  'editor:delete-line': -> @getModel().deleteLine()
-  'editor:cut-to-end-of-line': -> @getModel().cutToEndOfLine()
-  'editor:move-to-beginning-of-next-paragraph': -> @getModel().moveToBeginningOfNextParagraph()
-  'editor:move-to-beginning-of-previous-paragraph': -> @getModel().moveToBeginningOfPreviousParagraph()
-  'editor:move-to-beginning-of-screen-line': -> @getModel().moveToBeginningOfScreenLine()
-  'editor:move-to-beginning-of-line': -> @getModel().moveToBeginningOfLine()
-  'editor:move-to-end-of-screen-line': -> @getModel().moveToEndOfScreenLine()
-  'editor:move-to-end-of-line': -> @getModel().moveToEndOfLine()
-  'editor:move-to-first-character-of-line': -> @getModel().moveToFirstCharacterOfLine()
-  'editor:move-to-beginning-of-word': -> @getModel().moveToBeginningOfWord()
-  'editor:move-to-end-of-word': -> @getModel().moveToEndOfWord()
-  'editor:move-to-beginning-of-next-word': -> @getModel().moveToBeginningOfNextWord()
-  'editor:move-to-previous-word-boundary': -> @getModel().moveToPreviousWordBoundary()
-  'editor:move-to-next-word-boundary': -> @getModel().moveToNextWordBoundary()
-  'editor:select-to-beginning-of-next-paragraph': -> @getModel().selectToBeginningOfNextParagraph()
-  'editor:select-to-beginning-of-previous-paragraph': -> @getModel().selectToBeginningOfPreviousParagraph()
-  'editor:select-to-end-of-line': -> @getModel().selectToEndOfLine()
-  'editor:select-to-beginning-of-line': -> @getModel().selectToBeginningOfLine()
-  'editor:select-to-end-of-word': -> @getModel().selectToEndOfWord()
-  'editor:select-to-beginning-of-word': -> @getModel().selectToBeginningOfWord()
-  'editor:select-to-beginning-of-next-word': -> @getModel().selectToBeginningOfNextWord()
-  'editor:select-to-next-word-boundary': -> @getModel().selectToNextWordBoundary()
-  'editor:select-to-previous-word-boundary': -> @getModel().selectToPreviousWordBoundary()
-  'editor:select-to-first-character-of-line': -> @getModel().selectToFirstCharacterOfLine()
-  'editor:select-line': -> @getModel().selectLinesContainingCursors()
-  'editor:transpose': -> @getModel().transpose()
-  'editor:upper-case': -> @getModel().upperCase()
-  'editor:lower-case': -> @getModel().lowerCase()
-)
+  isUpdatedSynchronously: -> @updatedSynchronously
 
-atom.commands.add '[is=atom-text-editor]:not(.mini)', stopCommandEventPropagation(
-  'core:move-up': -> @getModel().moveUp()
-  'core:move-down': -> @getModel().moveDown()
-  'core:move-to-top': -> @getModel().moveToTop()
-  'core:move-to-bottom': -> @getModel().moveToBottom()
-  'core:page-up': -> @getModel().pageUp()
-  'core:page-down': -> @getModel().pageDown()
-  'core:select-up': -> @getModel().selectUp()
-  'core:select-down': -> @getModel().selectDown()
-  'core:select-to-top': -> @getModel().selectToTop()
-  'core:select-to-bottom': -> @getModel().selectToBottom()
-  'core:select-page-up': -> @getModel().selectPageUp()
-  'core:select-page-down': -> @getModel().selectPageDown()
-  'editor:indent': -> @getModel().indent()
-  'editor:auto-indent': -> @getModel().autoIndentSelectedRows()
-  'editor:indent-selected-rows': -> @getModel().indentSelectedRows()
-  'editor:outdent-selected-rows': -> @getModel().outdentSelectedRows()
-  'editor:newline': -> @getModel().insertNewline()
-  'editor:newline-below': -> @getModel().insertNewlineBelow()
-  'editor:newline-above': -> @getModel().insertNewlineAbove()
-  'editor:add-selection-below': -> @getModel().addSelectionBelow()
-  'editor:add-selection-above': -> @getModel().addSelectionAbove()
-  'editor:split-selections-into-lines': -> @getModel().splitSelectionsIntoLines()
-  'editor:toggle-soft-tabs': -> @getModel().toggleSoftTabs()
-  'editor:toggle-soft-wrap': -> @getModel().toggleSoftWrapped()
-  'editor:fold-all': -> @getModel().foldAll()
-  'editor:unfold-all': -> @getModel().unfoldAll()
-  'editor:fold-current-row': -> @getModel().foldCurrentRow()
-  'editor:unfold-current-row': -> @getModel().unfoldCurrentRow()
-  'editor:fold-selection': -> @getModel().foldSelectedLines()
-  'editor:fold-at-indent-level-1': -> @getModel().foldAllAtIndentLevel(0)
-  'editor:fold-at-indent-level-2': -> @getModel().foldAllAtIndentLevel(1)
-  'editor:fold-at-indent-level-3': -> @getModel().foldAllAtIndentLevel(2)
-  'editor:fold-at-indent-level-4': -> @getModel().foldAllAtIndentLevel(3)
-  'editor:fold-at-indent-level-5': -> @getModel().foldAllAtIndentLevel(4)
-  'editor:fold-at-indent-level-6': -> @getModel().foldAllAtIndentLevel(5)
-  'editor:fold-at-indent-level-7': -> @getModel().foldAllAtIndentLevel(6)
-  'editor:fold-at-indent-level-8': -> @getModel().foldAllAtIndentLevel(7)
-  'editor:fold-at-indent-level-9': -> @getModel().foldAllAtIndentLevel(8)
-  'editor:toggle-line-comments': -> @getModel().toggleLineCommentsInSelection()
-  'editor:log-cursor-scope': -> @getModel().logCursorScope()
-  'editor:checkout-head-revision': -> atom.project.getRepositories()[0]?.checkoutHeadForEditor(@getModel())
-  'editor:copy-path': -> @getModel().copyPathToClipboard()
-  'editor:move-line-up': -> @getModel().moveLineUp()
-  'editor:move-line-down': -> @getModel().moveLineDown()
-  'editor:duplicate-lines': -> @getModel().duplicateLines()
-  'editor:join-lines': -> @getModel().joinLines()
-  'editor:toggle-indent-guide': -> atom.config.set('editor.showIndentGuide', not atom.config.get('editor.showIndentGuide'))
-  'editor:toggle-line-numbers': -> atom.config.set('editor.showLineNumbers', not atom.config.get('editor.showLineNumbers'))
-  'editor:scroll-to-cursor': -> @getModel().scrollToCursorPosition()
-)
+  # Extended: Continuously reflows lines and line numbers. (Has performance overhead)
+  #
+  # `continuousReflow` A {Boolean} indicating whether to keep reflowing or not.
+  setContinuousReflow: (continuousReflow) ->
+    @component?.setContinuousReflow(continuousReflow)
 
-module.exports = TextEditorElement = document.registerElement 'atom-text-editor',
-  prototype: TextEditorElement.prototype
-  extends: 'div'
+  # Extended: get the width of a character of text displayed in this element.
+  #
+  # Returns a {Number} of pixels.
+  getDefaultCharacterWidth: ->
+    @getModel().getDefaultCharWidth()
+
+  # Extended: Get the maximum scroll top that can be applied to this element.
+  #
+  # Returns a {Number} of pixels.
+  getMaxScrollTop: ->
+    @component?.getMaxScrollTop()
+
+  # Extended: Converts a buffer position to a pixel position.
+  #
+  # * `bufferPosition` An object that represents a buffer position. It can be either
+  #   an {Object} (`{row, column}`), {Array} (`[row, column]`), or {Point}
+  #
+  # Returns an {Object} with two values: `top` and `left`, representing the pixel position.
+  pixelPositionForBufferPosition: (bufferPosition) ->
+    @component.pixelPositionForBufferPosition(bufferPosition)
+
+  # Extended: Converts a screen position to a pixel position.
+  #
+  # * `screenPosition` An object that represents a screen position. It can be either
+  #   an {Object} (`{row, column}`), {Array} (`[row, column]`), or {Point}
+  #
+  # Returns an {Object} with two values: `top` and `left`, representing the pixel positions.
+  pixelPositionForScreenPosition: (screenPosition) ->
+    @component.pixelPositionForScreenPosition(screenPosition)
+
+  # Extended: Retrieves the number of the row that is visible and currently at the
+  # top of the editor.
+  #
+  # Returns a {Number}.
+  getFirstVisibleScreenRow: ->
+    @getVisibleRowRange()[0]
+
+  # Extended: Retrieves the number of the row that is visible and currently at the
+  # bottom of the editor.
+  #
+  # Returns a {Number}.
+  getLastVisibleScreenRow: ->
+    @getVisibleRowRange()[1]
+
+  # Extended: call the given `callback` when the editor is attached to the DOM.
+  #
+  # * `callback` {Function}
+  onDidAttach: (callback) ->
+    @emitter.on("did-attach", callback)
+
+  # Extended: call the given `callback` when the editor is detached from the DOM.
+  #
+  # * `callback` {Function}
+  onDidDetach: (callback) ->
+    @emitter.on("did-detach", callback)
+
+  onDidChangeScrollTop: (callback) ->
+    @emitter.on("did-change-scroll-top", callback)
+
+  onDidChangeScrollLeft: (callback) ->
+    @emitter.on("did-change-scroll-left", callback)
+
+  setScrollLeft: (scrollLeft) ->
+    @component.setScrollLeft(scrollLeft)
+
+  setScrollRight: (scrollRight) ->
+    @component.setScrollRight(scrollRight)
+
+  setScrollTop: (scrollTop) ->
+    @component.setScrollTop(scrollTop)
+
+  setScrollBottom: (scrollBottom) ->
+    @component.setScrollBottom(scrollBottom)
+
+  # Essential: Scrolls the editor to the top
+  scrollToTop: ->
+    @setScrollTop(0)
+
+  # Essential: Scrolls the editor to the bottom
+  scrollToBottom: ->
+    @setScrollBottom(Infinity)
+
+  getScrollTop: ->
+    @component?.getScrollTop() or 0
+
+  getScrollLeft: ->
+    @component?.getScrollLeft() or 0
+
+  getScrollRight: ->
+    @component?.getScrollRight() or 0
+
+  getScrollBottom: ->
+    @component?.getScrollBottom() or 0
+
+  getScrollHeight: ->
+    @component?.getScrollHeight() or 0
+
+  getScrollWidth: ->
+    @component?.getScrollWidth() or 0
+
+  getVerticalScrollbarWidth: ->
+    @component?.getVerticalScrollbarWidth() or 0
+
+  getHorizontalScrollbarHeight: ->
+    @component?.getHorizontalScrollbarHeight() or 0
+
+  getVisibleRowRange: ->
+    @component?.getVisibleRowRange() or [0, 0]
+
+  intersectsVisibleRowRange: (startRow, endRow) ->
+    [visibleStart, visibleEnd] = @getVisibleRowRange()
+    not (endRow <= visibleStart or visibleEnd <= startRow)
+
+  selectionIntersectsVisibleRowRange: (selection) ->
+    {start, end} = selection.getScreenRange()
+    @intersectsVisibleRowRange(start.row, end.row + 1)
+
+  screenPositionForPixelPosition: (pixelPosition) ->
+    @component.screenPositionForPixelPosition(pixelPosition)
+
+  pixelRectForScreenRange: (screenRange) ->
+    @component.pixelRectForScreenRange(screenRange)
+
+  pixelRangeForScreenRange: (screenRange) ->
+    @component.pixelRangeForScreenRange(screenRange)
+
+  setWidth: (width) ->
+    @style.width = (@component.getGutterWidth() + width) + "px"
+    @component.measureDimensions()
+
+  getWidth: ->
+    @offsetWidth - @component.getGutterWidth()
+
+  setHeight: (height) ->
+    @style.height = height + "px"
+    @component.measureDimensions()
+
+  getHeight: ->
+    @offsetHeight
+
+module.exports = TextEditorElement = document.registerElement 'atom-text-editor', prototype: TextEditorElement.prototype

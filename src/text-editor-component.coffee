@@ -1,388 +1,243 @@
 _ = require 'underscore-plus'
-React = require 'react-atom-fork'
-{div, span} = require 'reactionary-atom-fork'
-{debounce, defaults, isEqualForProperties} = require 'underscore-plus'
 scrollbarStyle = require 'scrollbar-style'
 {Range, Point} = require 'text-buffer'
-grim = require 'grim'
+{CompositeDisposable} = require 'event-kit'
+ipc = require 'ipc'
 
-GutterComponent = require './gutter-component'
+TextEditorPresenter = require './text-editor-presenter'
+GutterContainerComponent = require './gutter-container-component'
 InputComponent = require './input-component'
 LinesComponent = require './lines-component'
 ScrollbarComponent = require './scrollbar-component'
 ScrollbarCornerComponent = require './scrollbar-corner-component'
-SubscriberMixin = require './subscriber-mixin'
+OverlayManager = require './overlay-manager'
+DOMElementPool = require './dom-element-pool'
+LinesYardstick = require './lines-yardstick'
 
 module.exports =
-TextEditorComponent = React.createClass
-  displayName: 'TextEditorComponent'
-  mixins: [SubscriberMixin]
+class TextEditorComponent
+  scrollSensitivity: 0.4
+  cursorBlinkPeriod: 800
+  cursorBlinkResumeDelay: 100
+  tileSize: 12
 
-  statics:
-    performSyncUpdates: false
-
-  visible: false
-  autoHeight: false
-  backgroundColor: null
-  gutterBackgroundColor: null
   pendingScrollTop: null
   pendingScrollLeft: null
-  selectOnMouseMove: false
   updateRequested: false
   updatesPaused: false
   updateRequestedWhilePaused: false
-  cursorMoved: false
-  selectionChanged: false
-  scrollingVertically: false
-  mouseWheelScreenRow: null
-  mouseWheelScreenRowClearDelay: 150
-  scrollSensitivity: 0.4
   heightAndWidthMeasurementRequested: false
   inputEnabled: true
-  scopedCharacterWidthsChangeCount: null
-  domPollingInterval: 100
-  domPollingIntervalId: null
-  domPollingPaused: false
   measureScrollbarsWhenShown: true
   measureLineHeightAndDefaultCharWidthWhenShown: true
-  remeasureCharacterWidthsWhenShown: false
+  stylingChangeAnimationFrameRequested: false
+  gutterComponent: null
+  mounted: true
+  initialized: false
 
-  render: ->
-    {focused, showIndentGuide, showLineNumbers, visible} = @state
-    {editor, mini, cursorBlinkPeriod, cursorBlinkResumeDelay} = @props
-    maxLineNumberDigits = editor.getLineCount().toString().length
-    hasSelection = editor.getLastSelection()? and !editor.getLastSelection().isEmpty()
-    style = {}
+  Object.defineProperty @prototype, "domNode",
+    get: -> @domNodeValue
+    set: (domNode) ->
+      @assert domNode?, "TextEditorComponent::domNode was set to null."
+      @domNodeValue = domNode
 
-    if @performedInitialMeasurement
-      renderedRowRange = @getRenderedRowRange()
-      [renderedStartRow, renderedEndRow] = renderedRowRange
-      cursorPixelRects = @getCursorPixelRects(renderedRowRange)
+  constructor: ({@editor, @hostElement, @rootElement, @stylesElement, @useShadowDOM, tileSize, @views, @themes, @config, @workspace, @assert, @grammars}) ->
+    @tileSize = tileSize if tileSize?
+    @disposables = new CompositeDisposable
 
-      tokenizedLines = editor.tokenizedLinesForScreenRows(renderedStartRow, renderedEndRow - 1)
-
-      decorations = editor.decorationsForScreenRowRange(renderedStartRow, renderedEndRow)
-      highlightDecorations = @getHighlightDecorations(decorations)
-      lineDecorations = @getLineDecorations(decorations)
-      placeholderText = editor.getPlaceholderText() if editor.isEmpty()
-      visible = @isVisible()
-
-      scrollHeight = editor.getScrollHeight()
-      scrollWidth = editor.getScrollWidth()
-      scrollTop = editor.getScrollTop()
-      scrollLeft = editor.getScrollLeft()
-      lineHeightInPixels = editor.getLineHeightInPixels()
-      defaultCharWidth = editor.getDefaultCharWidth()
-      scrollViewHeight = editor.getHeight()
-      lineWidth = Math.max(scrollWidth, editor.getWidth())
-      horizontalScrollbarHeight = editor.getHorizontalScrollbarHeight()
-      verticalScrollbarWidth = editor.getVerticalScrollbarWidth()
-      verticallyScrollable = editor.verticallyScrollable()
-      horizontallyScrollable = editor.horizontallyScrollable()
-      hiddenInputStyle = @getHiddenInputPosition()
-      hiddenInputStyle.WebkitTransform = 'translateZ(0)' if @useHardwareAcceleration
-      if @mouseWheelScreenRow? and not (renderedStartRow <= @mouseWheelScreenRow < renderedEndRow)
-        mouseWheelScreenRow = @mouseWheelScreenRow
-
-      style.height = scrollViewHeight if @autoHeight
-
-    className = 'editor-contents'
-    className += ' is-focused' if focused
-    className += ' has-selection' if hasSelection
-
-    div {className, style, tabIndex: -1},
-      if @shouldRenderGutter()
-        GutterComponent {
-          ref: 'gutter', onMouseDown: @onGutterMouseDown, lineDecorations,
-          defaultCharWidth, editor, renderedRowRange, maxLineNumberDigits, scrollViewHeight,
-          scrollTop, scrollHeight, lineHeightInPixels, @pendingChanges, mouseWheelScreenRow,
-          @useHardwareAcceleration, @performedInitialMeasurement, @backgroundColor, @gutterBackgroundColor
-        }
-
-      div ref: 'scrollView', className: 'scroll-view', onMouseDown: @onMouseDown,
-        InputComponent
-          ref: 'input'
-          className: 'hidden-input'
-          style: hiddenInputStyle
-          onFocus: @onInputFocused
-          onBlur: @onInputBlurred
-
-        LinesComponent {
-          ref: 'lines',
-          editor, lineHeightInPixels, defaultCharWidth, tokenizedLines, lineDecorations, highlightDecorations,
-          showIndentGuide, renderedRowRange, @pendingChanges, scrollTop, scrollLeft,
-          @scrollingVertically, scrollHeight, scrollWidth, mouseWheelScreenRow,
-          visible, scrollViewHeight, @scopedCharacterWidthsChangeCount, lineWidth, @useHardwareAcceleration,
-          placeholderText, @performedInitialMeasurement, @backgroundColor, cursorPixelRects,
-          cursorBlinkPeriod, cursorBlinkResumeDelay, mini
-        }
-
-        ScrollbarComponent
-          ref: 'horizontalScrollbar'
-          className: 'horizontal-scrollbar'
-          orientation: 'horizontal'
-          onScroll: @onHorizontalScroll
-          scrollLeft: scrollLeft
-          scrollWidth: scrollWidth
-          visible: horizontallyScrollable
-          scrollableInOppositeDirection: verticallyScrollable
-          verticalScrollbarWidth: verticalScrollbarWidth
-          horizontalScrollbarHeight: horizontalScrollbarHeight
-          useHardwareAcceleration: @useHardwareAcceleration
-
-      ScrollbarComponent
-        ref: 'verticalScrollbar'
-        className: 'vertical-scrollbar'
-        orientation: 'vertical'
-        onScroll: @onVerticalScroll
-        scrollTop: scrollTop
-        scrollHeight: scrollHeight
-        visible: verticallyScrollable
-        scrollableInOppositeDirection: horizontallyScrollable
-        verticalScrollbarWidth: verticalScrollbarWidth
-        horizontalScrollbarHeight: horizontalScrollbarHeight
-        useHardwareAcceleration: @useHardwareAcceleration
-
-      # Also used to measure the height/width of scrollbars after the initial render
-      ScrollbarCornerComponent
-        ref: 'scrollbarCorner'
-        visible: horizontallyScrollable and verticallyScrollable
-        measuringScrollbars: @measuringScrollbars
-        height: horizontalScrollbarHeight
-        width: verticalScrollbarWidth
-
-  getPageRows: ->
-    {editor} = @props
-    Math.max(1, Math.ceil(editor.getHeight() / editor.getLineHeightInPixels()))
-
-  shouldRenderGutter: ->
-    not @props.mini and @state.showLineNumbers
-
-  getInitialState: -> {}
-
-  getDefaultProps: ->
-    cursorBlinkPeriod: 800
-    cursorBlinkResumeDelay: 100
-    lineOverdrawMargin: 15
-
-  componentWillMount: ->
-    @pendingChanges = []
-    @props.editor.manageScrollPosition = true
     @observeConfig()
-    @setScrollSensitivity(atom.config.get('editor.scrollSensitivity'))
+    @setScrollSensitivity(@config.get('editor.scrollSensitivity'))
 
-  componentDidMount: ->
-    {editor} = @props
+    @presenter = new TextEditorPresenter
+      model: @editor
+      scrollTop: 0
+      scrollLeft: 0
+      scrollRow: @editor.getScrollRow()
+      scrollColumn: @editor.getScrollColumn()
+      tileSize: tileSize
+      cursorBlinkPeriod: @cursorBlinkPeriod
+      cursorBlinkResumeDelay: @cursorBlinkResumeDelay
+      stoppedScrollingDelay: 200
+      config: @config
+
+    @presenter.onDidUpdateState(@requestUpdate)
+
+    @domElementPool = new DOMElementPool
+
+    @domNode = document.createElement('div')
+    if @useShadowDOM
+      @domNode.classList.add('editor-contents--private')
+
+      insertionPoint = document.createElement('content')
+      insertionPoint.setAttribute('select', 'atom-overlay')
+      @domNode.appendChild(insertionPoint)
+      @overlayManager = new OverlayManager(@presenter, @hostElement, @views)
+    else
+      @domNode.classList.add('editor-contents')
+      @overlayManager = new OverlayManager(@presenter, @domNode, @views)
+
+    @scrollViewNode = document.createElement('div')
+    @scrollViewNode.classList.add('scroll-view')
+    @domNode.appendChild(@scrollViewNode)
+
+    @hiddenInputComponent = new InputComponent
+    @scrollViewNode.appendChild(@hiddenInputComponent.getDomNode())
+
+    @linesComponent = new LinesComponent({@presenter, @hostElement, @useShadowDOM, @domElementPool, @assert, @grammars})
+    @scrollViewNode.appendChild(@linesComponent.getDomNode())
+
+    @linesYardstick = new LinesYardstick(@editor, @presenter, @linesComponent, @grammars)
+    @presenter.setLinesYardstick(@linesYardstick)
+
+    @horizontalScrollbarComponent = new ScrollbarComponent({orientation: 'horizontal', onScroll: @onHorizontalScroll})
+    @scrollViewNode.appendChild(@horizontalScrollbarComponent.getDomNode())
+
+    @verticalScrollbarComponent = new ScrollbarComponent({orientation: 'vertical', onScroll: @onVerticalScroll})
+    @domNode.appendChild(@verticalScrollbarComponent.getDomNode())
+
+    @scrollbarCornerComponent = new ScrollbarCornerComponent
+    @domNode.appendChild(@scrollbarCornerComponent.getDomNode())
 
     @observeEditor()
     @listenForDOMEvents()
 
-    @subscribe atom.themes.onDidAddStylesheet @onStylesheetsChanged
-    @subscribe atom.themes.onDidUpdateStylesheet @onStylesheetsChanged
-    @subscribe atom.themes.onDidRemoveStylesheet @onStylesheetsChanged
-    unless atom.themes.isInitialLoadComplete()
-      @subscribe atom.themes.onDidReloadAll @onStylesheetsChanged
-    @subscribe scrollbarStyle.changes, @refreshScrollbars
+    @disposables.add @stylesElement.onDidAddStyleElement @onStylesheetsChanged
+    @disposables.add @stylesElement.onDidUpdateStyleElement @onStylesheetsChanged
+    @disposables.add @stylesElement.onDidRemoveStyleElement @onStylesheetsChanged
+    unless @themes.isInitialLoadComplete()
+      @disposables.add @themes.onDidChangeActiveThemes @onAllThemesLoaded
+    @disposables.add scrollbarStyle.onDidChangePreferredScrollbarStyle @refreshScrollbars
 
-    @domPollingIntervalId = setInterval(@pollDOM, @domPollingInterval)
-    @updateParentViewFocusedClassIfNeeded({})
-    @updateParentViewMiniClassIfNeeded({})
+    @disposables.add @views.pollDocument(@pollDOM)
+
+    @updateSync()
     @checkForVisibilityChange()
+    @initialized = true
 
-  componentWillUnmount: ->
-    {editor, parentView} = @props
+  destroy: ->
+    @mounted = false
+    @disposables.dispose()
+    @presenter.destroy()
+    @gutterContainerComponent?.destroy()
+    @domElementPool.clear()
 
-    parentView.__spacePenView.trigger 'editor:will-be-removed', [parentView.__spacePenView]
-    @unsubscribe()
-    window.removeEventListener 'resize', @requestHeightAndWidthMeasurement
-    clearInterval(@domPollingIntervalId)
-    @domPollingIntervalId = null
+    @verticalScrollbarComponent.destroy()
+    @horizontalScrollbarComponent.destroy()
 
-  componentWillReceiveProps: (newProps) ->
-    @props.editor.setMini(newProps.mini)
+    @onVerticalScroll = null
+    @onHorizontalScroll = null
 
-  componentDidUpdate: (prevProps, prevState) ->
-    cursorMoved = @cursorMoved
-    selectionChanged = @selectionChanged
-    @pendingChanges.length = 0
-    @cursorMoved = false
-    @selectionChanged = false
+  getDomNode: ->
+    @domNode
 
-    if @props.editor.isAlive()
-      @updateParentViewFocusedClassIfNeeded(prevState)
-      @updateParentViewMiniClassIfNeeded(prevState)
-      @props.parentView.__spacePenView.trigger 'cursor:moved' if cursorMoved
-      @props.parentView.__spacePenView.trigger 'selection:changed' if selectionChanged
-      @props.parentView.__spacePenView.trigger 'editor:display-updated'
+  updateSync: ->
+    @oldState ?= {}
+    @newState = @presenter.getState()
+
+    if @editor.getLastSelection()? and not @editor.getLastSelection().isEmpty()
+      @domNode.classList.add('has-selection')
+    else
+      @domNode.classList.remove('has-selection')
+
+    if @newState.focused isnt @oldState.focused
+      @domNode.classList.toggle('is-focused', @newState.focused)
+
+    @performedInitialMeasurement = false if @editor.isDestroyed()
+
+    if @performedInitialMeasurement
+      if @newState.height isnt @oldState.height
+        if @newState.height?
+          @domNode.style.height = @newState.height + 'px'
+        else
+          @domNode.style.height = ''
+
+    if @newState.gutters.length
+      @mountGutterContainerComponent() unless @gutterContainerComponent?
+      @gutterContainerComponent.updateSync(@newState)
+    else
+      @gutterContainerComponent?.getDomNode()?.remove()
+      @gutterContainerComponent = null
+
+    @hiddenInputComponent.updateSync(@newState)
+    @linesComponent.updateSync(@newState)
+    @horizontalScrollbarComponent.updateSync(@newState)
+    @verticalScrollbarComponent.updateSync(@newState)
+    @scrollbarCornerComponent.updateSync(@newState)
+
+    @overlayManager?.render(@newState)
+
+    if @clearPoolAfterUpdate
+      @domElementPool.clear()
+      @clearPoolAfterUpdate = false
+
+    if @editor.isAlive()
+      @updateParentViewFocusedClassIfNeeded()
+      @updateParentViewMiniClass()
+
+  readAfterUpdateSync: =>
+    @overlayManager?.measureOverlays()
+
+  mountGutterContainerComponent: ->
+    @gutterContainerComponent = new GutterContainerComponent({@editor, @onLineNumberGutterMouseDown, @domElementPool, @views})
+    @domNode.insertBefore(@gutterContainerComponent.getDomNode(), @domNode.firstChild)
 
   becameVisible: ->
     @updatesPaused = true
+    @measureScrollbars() if @measureScrollbarsWhenShown
     @sampleFontStyling()
     @sampleBackgroundColors()
-    @measureHeightAndWidth()
-    @measureScrollbars() if @measureScrollbarsWhenShown
+    @measureWindowSize()
+    @measureDimensions()
     @measureLineHeightAndDefaultCharWidth() if @measureLineHeightAndDefaultCharWidthWhenShown
-    @remeasureCharacterWidths() if @remeasureCharacterWidthsWhenShown
-    @props.editor.setVisible(true)
+    @editor.setVisible(true)
     @performedInitialMeasurement = true
     @updatesPaused = false
-    @forceUpdate() if @updateRequestedWhilePaused
+    @updateSync() if @canUpdate()
 
-  requestUpdate: ->
-    return unless @isMounted()
+  requestUpdate: =>
+    return unless @canUpdate()
 
     if @updatesPaused
       @updateRequestedWhilePaused = true
       return
 
-    if @performSyncUpdates ? TextEditorComponent.performSyncUpdates
-      @forceUpdate()
+    if @hostElement.isUpdatedSynchronously()
+      @updateSync()
     else unless @updateRequested
       @updateRequested = true
-      requestAnimationFrame =>
+      @views.updateDocument =>
         @updateRequested = false
-        @forceUpdate() if @isMounted()
+        @updateSync() if @canUpdate()
+      @views.readDocument(@readAfterUpdateSync)
+
+  canUpdate: ->
+    @mounted and @editor.isAlive()
 
   requestAnimationFrame: (fn) ->
     @updatesPaused = true
-    @pauseDOMPolling()
     requestAnimationFrame =>
       fn()
       @updatesPaused = false
-      if @updateRequestedWhilePaused and @isMounted()
+      if @updateRequestedWhilePaused and @canUpdate()
         @updateRequestedWhilePaused = false
-        @forceUpdate()
+        @updateSync()
 
   getTopmostDOMNode: ->
-    @props.parentView
-
-  getRenderedRowRange: ->
-    {editor, lineOverdrawMargin} = @props
-    [visibleStartRow, visibleEndRow] = editor.getVisibleRowRange()
-    renderedStartRow = Math.max(0, visibleStartRow - lineOverdrawMargin)
-    renderedEndRow = Math.min(editor.getScreenLineCount(), visibleEndRow + lineOverdrawMargin)
-    [renderedStartRow, renderedEndRow]
-
-  getHiddenInputPosition: ->
-    {editor} = @props
-    {focused} = @state
-    return {top: 0, left: 0} unless @isMounted() and focused and editor.getLastCursor()?
-
-    {top, left, height, width} = editor.getLastCursor().getPixelRect()
-    width = 2 if width is 0 # Prevent autoscroll at the end of longest line
-    top -= editor.getScrollTop()
-    left -= editor.getScrollLeft()
-    top = Math.max(0, Math.min(editor.getHeight() - height, top))
-    left = Math.max(0, Math.min(editor.getWidth() - width, left))
-    {top, left}
-
-  getCursorScreenRanges: (renderedRowRange) ->
-    {editor} = @props
-    [renderedStartRow, renderedEndRow] = renderedRowRange
-
-    cursorScreenRanges = {}
-    for selection in editor.getSelections() when selection.isEmpty()
-      {cursor} = selection
-      screenRange = cursor.getScreenRange()
-      if renderedStartRow <= screenRange.start.row < renderedEndRow
-        cursorScreenRanges[cursor.id] = screenRange
-    cursorScreenRanges
-
-  getCursorPixelRects: (renderedRowRange) ->
-    {editor} = @props
-    [renderedStartRow, renderedEndRow] = renderedRowRange
-
-    cursorPixelRects = {}
-    for selection in editor.getSelections() when selection.isEmpty()
-      {cursor} = selection
-      screenRange = cursor.getScreenRange()
-      if renderedStartRow <= screenRange.start.row < renderedEndRow
-        cursorPixelRects[cursor.id] = editor.pixelRectForScreenRange(screenRange)
-    cursorPixelRects
-
-  getLineDecorations: (decorationsByMarkerId) ->
-    {editor, mini} = @props
-    return {} if mini
-
-    decorationsByScreenRow = {}
-    for markerId, decorations of decorationsByMarkerId
-      marker = editor.getMarker(markerId)
-      screenRange = null
-      headScreenRow = null
-      if marker.isValid()
-        for decoration in decorations
-          if decoration.isType('gutter') or decoration.isType('line')
-            decorationParams = decoration.getProperties()
-            screenRange ?= marker.getScreenRange()
-            headScreenRow ?= marker.getHeadScreenPosition().row
-            startRow = screenRange.start.row
-            endRow = screenRange.end.row
-            endRow-- if not screenRange.isEmpty() and screenRange.end.column == 0
-            for screenRow in [startRow..endRow]
-              continue if decorationParams.onlyHead and screenRow isnt headScreenRow
-              if screenRange.isEmpty()
-                continue if decorationParams.onlyNonEmpty
-              else
-                continue if decorationParams.onlyEmpty
-
-              decorationsByScreenRow[screenRow] ?= {}
-              decorationsByScreenRow[screenRow][decoration.id] = decorationParams
-
-    decorationsByScreenRow
-
-  getHighlightDecorations: (decorationsByMarkerId) ->
-    {editor} = @props
-    filteredDecorations = {}
-    for markerId, decorations of decorationsByMarkerId
-      marker = editor.getMarker(markerId)
-      screenRange = marker.getScreenRange()
-      if marker.isValid() and not screenRange.isEmpty()
-        for decoration in decorations
-          if decoration.isType('highlight')
-            decorationParams = decoration.getProperties()
-            filteredDecorations[markerId] ?=
-              id: markerId
-              startPixelPosition: editor.pixelPositionForScreenPosition(screenRange.start)
-              endPixelPosition: editor.pixelPositionForScreenPosition(screenRange.end)
-              decorations: []
-            filteredDecorations[markerId].decorations.push decorationParams
-
-    filteredDecorations
+    @hostElement
 
   observeEditor: ->
-    {editor} = @props
-    @subscribe editor.onDidChange(@onScreenLinesChanged)
-    @subscribe editor.observeCursors(@onCursorAdded)
-    @subscribe editor.observeSelections(@onSelectionAdded)
-    @subscribe editor.observeDecorations(@onDecorationAdded)
-    @subscribe editor.onDidRemoveDecoration(@onDecorationRemoved)
-    @subscribe editor.onDidChangeCharacterWidths(@onCharacterWidthsChanged)
-    @subscribe editor.onDidChangePlaceholderText(@onPlaceholderTextChanged)
-    @subscribe editor.$scrollTop.changes, @onScrollTopChanged
-    @subscribe editor.$scrollLeft.changes, @requestUpdate
-    @subscribe editor.$verticalScrollbarWidth.changes, @requestUpdate
-    @subscribe editor.$horizontalScrollbarHeight.changes, @requestUpdate
-    @subscribe editor.$height.changes, @requestUpdate
-    @subscribe editor.$width.changes, @requestUpdate
-    @subscribe editor.$defaultCharWidth.changes, @requestUpdate
-    @subscribe editor.$lineHeightInPixels.changes, @requestUpdate
+    @disposables.add @editor.observeGrammar(@onGrammarChanged)
 
   listenForDOMEvents: ->
-    node = @getDOMNode()
-    node.addEventListener 'mousewheel', @onMouseWheel
-    node.addEventListener 'focus', @onFocus # For some reason, React's built in focus events seem to bubble
-    node.addEventListener 'textInput', @onTextInput
-
-    scrollViewNode = @refs.scrollView.getDOMNode()
-    scrollViewNode.addEventListener 'scroll', @onScrollViewScroll
-    window.addEventListener 'resize', @requestHeightAndWidthMeasurement
+    @domNode.addEventListener 'mousewheel', @onMouseWheel
+    @domNode.addEventListener 'textInput', @onTextInput
+    @scrollViewNode.addEventListener 'mousedown', @onMouseDown
+    @scrollViewNode.addEventListener 'scroll', @onScrollViewScroll
 
     @listenForIMEEvents()
+    @trackSelectionClipboard() if process.platform is 'linux'
 
   listenForIMEEvents: ->
-    node = @getDOMNode()
-    {editor} = @props
-
     # The IME composition events work like this:
     #
     # User types 's', chromium pops up the completion helper
@@ -396,25 +251,62 @@ TextEditorComponent = React.createClass
     #   4. compositionend fired
     #   5. textInput fired; event.data == the completion string
 
-    selectedText = null
-    node.addEventListener 'compositionstart', ->
-      selectedText = editor.getSelectedText()
-    node.addEventListener 'compositionupdate', (event) ->
-      editor.insertText(event.data, select: true, undo: 'skip')
-    node.addEventListener 'compositionend', (event) ->
-      editor.insertText(selectedText, select: true, undo: 'skip')
+    checkpoint = null
+    @domNode.addEventListener 'compositionstart', =>
+      checkpoint = @editor.createCheckpoint()
+    @domNode.addEventListener 'compositionupdate', (event) =>
+      @editor.insertText(event.data, select: true)
+    @domNode.addEventListener 'compositionend', (event) =>
+      @editor.revertToCheckpoint(checkpoint)
       event.target.value = ''
 
+  # Listen for selection changes and store the currently selected text
+  # in the selection clipboard. This is only applicable on Linux.
+  trackSelectionClipboard: ->
+    timeoutId = null
+    writeSelectedTextToSelectionClipboard = =>
+      return if @editor.isDestroyed()
+      if selectedText = @editor.getSelectedText()
+        # This uses ipc.send instead of clipboard.writeText because
+        # clipboard.writeText is a sync ipc call on Linux and that
+        # will slow down selections.
+        ipc.send('write-text-to-selection-clipboard', selectedText)
+    @disposables.add @editor.onDidChangeSelectionRange ->
+      clearTimeout(timeoutId)
+      timeoutId = setTimeout(writeSelectedTextToSelectionClipboard)
+
   observeConfig: ->
-    @subscribe atom.config.observe 'editor.showIndentGuide', @setShowIndentGuide
-    @subscribe atom.config.observe 'editor.showLineNumbers', @setShowLineNumbers
-    @subscribe atom.config.observe 'editor.scrollSensitivity', @setScrollSensitivity
-    @subscribe atom.config.observe 'editor.useHardwareAcceleration', @setUseHardwareAcceleration
+    @disposables.add @config.onDidChange 'editor.fontSize', =>
+      @sampleFontStyling()
+      @invalidateCharacterWidths()
+    @disposables.add @config.onDidChange 'editor.fontFamily', =>
+      @sampleFontStyling()
+      @invalidateCharacterWidths()
+    @disposables.add @config.onDidChange 'editor.lineHeight', =>
+      @sampleFontStyling()
+      @invalidateCharacterWidths()
 
-  onFocus: ->
-    @refs.input.focus() if @isMounted()
+  onGrammarChanged: =>
+    if @scopedConfigDisposables?
+      @scopedConfigDisposables.dispose()
+      @disposables.remove(@scopedConfigDisposables)
 
-  onTextInput: (event) ->
+    @scopedConfigDisposables = new CompositeDisposable
+    @disposables.add(@scopedConfigDisposables)
+
+    scope = @editor.getRootScopeDescriptor()
+    @scopedConfigDisposables.add @config.observe 'editor.scrollSensitivity', {scope}, @setScrollSensitivity
+
+  focused: ->
+    if @mounted
+      @presenter.setFocused(true)
+      @hiddenInputComponent.getDomNode().focus()
+
+  blurred: ->
+    if @mounted
+      @presenter.setFocused(false)
+
+  onTextInput: (event) =>
     event.stopPropagation()
 
     # If we prevent the insertion of a space character, then the browser
@@ -423,7 +315,6 @@ TextEditorComponent = React.createClass
 
     return unless @isInputEnabled()
 
-    {editor} = @props
     inputNode = event.target
 
     # Work around of the accented character suggestion feature in OS X.
@@ -431,21 +322,13 @@ TextEditorComponent = React.createClass
     # replacing the previous un-accented character with an accented variant, it
     # will select backward over it.
     selectedLength = inputNode.selectionEnd - inputNode.selectionStart
-    editor.selectLeft() if selectedLength is 1
+    @editor.selectLeft() if selectedLength is 1
 
-    inputNode.value = event.data if editor.insertText(event.data)
+    insertedRange = @editor.insertText(event.data, groupUndo: true)
+    inputNode.value = event.data if insertedRange
 
-
-  onInputFocused: ->
-    @setState(focused: true)
-
-  onInputBlurred: ->
-    @setState(focused: false)
-
-  onVerticalScroll: (scrollTop) ->
-    {editor} = @props
-
-    return if @updateRequested or scrollTop is editor.getScrollTop()
+  onVerticalScroll: (scrollTop) =>
+    return if @updateRequested or scrollTop is @presenter.getScrollTop()
 
     animationFramePending = @pendingScrollTop?
     @pendingScrollTop = scrollTop
@@ -453,83 +336,165 @@ TextEditorComponent = React.createClass
       @requestAnimationFrame =>
         pendingScrollTop = @pendingScrollTop
         @pendingScrollTop = null
-        @props.editor.setScrollTop(pendingScrollTop)
+        @presenter.setScrollTop(pendingScrollTop)
+        @presenter.commitPendingScrollTopPosition()
 
-  onHorizontalScroll: (scrollLeft) ->
-    {editor} = @props
-
-    return if @updateRequested or scrollLeft is editor.getScrollLeft()
+  onHorizontalScroll: (scrollLeft) =>
+    return if @updateRequested or scrollLeft is @presenter.getScrollLeft()
 
     animationFramePending = @pendingScrollLeft?
     @pendingScrollLeft = scrollLeft
     unless animationFramePending
       @requestAnimationFrame =>
-        @props.editor.setScrollLeft(@pendingScrollLeft)
+        @presenter.setScrollLeft(@pendingScrollLeft)
+        @presenter.commitPendingScrollLeftPosition()
         @pendingScrollLeft = null
 
-  onMouseWheel: (event) ->
-    {editor} = @props
-
+  onMouseWheel: (event) =>
     # Only scroll in one direction at a time
     {wheelDeltaX, wheelDeltaY} = event
+
+    # Ctrl+MouseWheel adjusts font size.
+    if event.ctrlKey and @config.get('editor.zoomFontWhenCtrlScrolling')
+      if wheelDeltaY > 0
+        @workspace.increaseFontSize()
+      else if wheelDeltaY < 0
+        @workspace.decreaseFontSize()
+      event.preventDefault()
+      return
+
     if Math.abs(wheelDeltaX) > Math.abs(wheelDeltaY)
       # Scrolling horizontally
-      previousScrollLeft = editor.getScrollLeft()
-      editor.setScrollLeft(previousScrollLeft - Math.round(wheelDeltaX * @scrollSensitivity))
-      event.preventDefault() unless previousScrollLeft is editor.getScrollLeft()
+      previousScrollLeft = @presenter.getScrollLeft()
+      updatedScrollLeft = previousScrollLeft - Math.round(wheelDeltaX * @scrollSensitivity)
+
+      event.preventDefault() if @presenter.canScrollLeftTo(updatedScrollLeft)
+      @presenter.setScrollLeft(updatedScrollLeft)
     else
       # Scrolling vertically
-      @mouseWheelScreenRow = @screenRowForNode(event.target)
-      @clearMouseWheelScreenRowAfterDelay ?= debounce(@clearMouseWheelScreenRow, @mouseWheelScreenRowClearDelay)
-      @clearMouseWheelScreenRowAfterDelay()
-      previousScrollTop = editor.getScrollTop()
-      editor.setScrollTop(previousScrollTop - Math.round(wheelDeltaY * @scrollSensitivity))
-      event.preventDefault() unless previousScrollTop is editor.getScrollTop()
+      @presenter.setMouseWheelScreenRow(@screenRowForNode(event.target))
+      previousScrollTop = @presenter.getScrollTop()
+      updatedScrollTop = previousScrollTop - Math.round(wheelDeltaY * @scrollSensitivity)
 
-  onScrollViewScroll: ->
-    if @isMounted()
+      event.preventDefault() if @presenter.canScrollTopTo(updatedScrollTop)
+      @presenter.setScrollTop(updatedScrollTop)
+
+  onScrollViewScroll: =>
+    if @mounted
       console.warn "TextEditorScrollView scrolled when it shouldn't have."
-      scrollViewNode = @refs.scrollView.getDOMNode()
-      scrollViewNode.scrollTop = 0
-      scrollViewNode.scrollLeft = 0
+      @scrollViewNode.scrollTop = 0
+      @scrollViewNode.scrollLeft = 0
 
-  onMouseDown: (event) ->
-    return unless event.button is 0 # only handle the left mouse button
+  onDidChangeScrollTop: (callback) ->
+    @presenter.onDidChangeScrollTop(callback)
+
+  onDidChangeScrollLeft: (callback) ->
+    @presenter.onDidChangeScrollLeft(callback)
+
+  setScrollLeft: (scrollLeft) ->
+    @presenter.setScrollLeft(scrollLeft)
+
+  setScrollRight: (scrollRight) ->
+    @presenter.setScrollRight(scrollRight)
+
+  setScrollTop: (scrollTop) ->
+    @presenter.setScrollTop(scrollTop)
+
+  setScrollBottom: (scrollBottom) ->
+    @presenter.setScrollBottom(scrollBottom)
+
+  getScrollTop: ->
+    @presenter.getScrollTop()
+
+  getScrollLeft: ->
+    @presenter.getScrollLeft()
+
+  getScrollRight: ->
+    @presenter.getScrollRight()
+
+  getScrollBottom: ->
+    @presenter.getScrollBottom()
+
+  getScrollHeight: ->
+    @presenter.getScrollHeight()
+
+  getScrollWidth: ->
+    @presenter.getScrollWidth()
+
+  getMaxScrollTop: ->
+    @presenter.getMaxScrollTop()
+
+  getVerticalScrollbarWidth: ->
+    @presenter.getVerticalScrollbarWidth()
+
+  getHorizontalScrollbarHeight: ->
+    @presenter.getHorizontalScrollbarHeight()
+
+  getVisibleRowRange: ->
+    @presenter.getVisibleRowRange()
+
+  pixelPositionForScreenPosition: ->
+    @linesYardstick.pixelPositionForScreenPosition(arguments...)
+
+  screenPositionForPixelPosition: ->
+    @linesYardstick.screenPositionForPixelPosition(arguments...)
+
+  pixelRectForScreenRange: ->
+    @linesYardstick.pixelRectForScreenRange(arguments...)
+
+  pixelRangeForScreenRange: (screenRange, clip=true) ->
+    {start, end} = Range.fromObject(screenRange)
+    {start: @pixelPositionForScreenPosition(start, clip), end: @pixelPositionForScreenPosition(end, clip)}
+
+  pixelPositionForBufferPosition: (bufferPosition) ->
+    @pixelPositionForScreenPosition(
+      @editor.screenPositionForBufferPosition(bufferPosition)
+    )
+
+  onMouseDown: (event) =>
+    unless event.button is 0 or (event.button is 1 and process.platform is 'linux')
+      # Only handle mouse down events for left mouse button on all platforms
+      # and middle mouse button on Linux since it pastes the selection clipboard
+      return
+
     return if event.target?.classList.contains('horizontal-scrollbar')
 
-    {editor} = @props
     {detail, shiftKey, metaKey, ctrlKey} = event
 
     # CTRL+click brings up the context menu on OSX, so don't handle those either
     return if ctrlKey and process.platform is 'darwin'
 
     # Prevent focusout event on hidden input if editor is already focused
-    event.preventDefault() if @state.focused
+    event.preventDefault() if @oldState.focused
 
     screenPosition = @screenPositionForMouseEvent(event)
 
     if event.target?.classList.contains('fold-marker')
-      bufferRow = editor.bufferRowForScreenRow(screenPosition.row)
-      editor.unfoldBufferRow(bufferRow)
+      bufferRow = @editor.bufferRowForScreenRow(screenPosition.row)
+      @editor.unfoldBufferRow(bufferRow)
       return
 
     switch detail
       when 1
         if shiftKey
-          editor.selectToScreenPosition(screenPosition)
+          @editor.selectToScreenPosition(screenPosition)
         else if metaKey or (ctrlKey and process.platform isnt 'darwin')
-          editor.addCursorAtScreenPosition(screenPosition)
+          cursorAtScreenPosition = @editor.getCursorAtScreenPosition(screenPosition)
+          if cursorAtScreenPosition and @editor.hasMultipleCursors()
+            cursorAtScreenPosition.destroy()
+          else
+            @editor.addCursorAtScreenPosition(screenPosition, autoscroll: false)
         else
-          editor.setCursorScreenPosition(screenPosition)
+          @editor.setCursorScreenPosition(screenPosition, autoscroll: false)
       when 2
-        editor.getLastSelection().selectWord()
+        @editor.getLastSelection().selectWord(autoscroll: false)
       when 3
-        editor.getLastSelection().selectLine()
+        @editor.getLastSelection().selectLine(null, autoscroll: false)
 
-    @handleDragUntilMouseUp event, (screenPosition) ->
-      editor.selectToScreenPosition(screenPosition)
+    @handleDragUntilMouseUp (screenPosition) =>
+      @editor.selectToScreenPosition(screenPosition, suppressSelectionMerge: true, autoscroll: false)
 
-  onGutterMouseDown: (event) ->
+  onLineNumberGutterMouseDown: (event) =>
     return unless event.button is 0 # only handle the left mouse button
 
     {shiftKey, metaKey, ctrlKey} = event
@@ -541,141 +506,83 @@ TextEditorComponent = React.createClass
     else
       @onGutterClick(event)
 
-  onGutterClick: (event) ->
-    {editor} = @props
-    clickedRow = @screenPositionForMouseEvent(event).row
+  onGutterClick: (event) =>
+    clickedScreenRow = @screenPositionForMouseEvent(event).row
+    clickedBufferRow = @editor.bufferRowForScreenRow(clickedScreenRow)
+    initialScreenRange = @editor.screenRangeForBufferRange([[clickedBufferRow, 0], [clickedBufferRow + 1, 0]])
+    @editor.setSelectedScreenRange(initialScreenRange, preserveFolds: true, autoscroll: false)
+    @handleGutterDrag(initialScreenRange)
 
-    editor.setSelectedScreenRange([[clickedRow, 0], [clickedRow + 1, 0]], preserveFolds: true)
+  onGutterMetaClick: (event) =>
+    clickedScreenRow = @screenPositionForMouseEvent(event).row
+    clickedBufferRow = @editor.bufferRowForScreenRow(clickedScreenRow)
+    initialScreenRange = @editor.screenRangeForBufferRange([[clickedBufferRow, 0], [clickedBufferRow + 1, 0]])
+    @editor.addSelectionForScreenRange(initialScreenRange, preserveFolds: true, autoscroll: false)
+    @handleGutterDrag(initialScreenRange)
 
-    @handleDragUntilMouseUp event, (screenPosition) ->
-      dragRow = screenPosition.row
-      if dragRow < clickedRow # dragging up
-        editor.setSelectedScreenRange([[dragRow, 0], [clickedRow + 1, 0]], preserveFolds: true)
-      else
-        editor.setSelectedScreenRange([[clickedRow, 0], [dragRow + 1, 0]], preserveFolds: true)
+  onGutterShiftClick: (event) =>
+    tailScreenPosition = @editor.getLastSelection().getTailScreenPosition()
+    clickedScreenRow = @screenPositionForMouseEvent(event).row
+    clickedBufferRow = @editor.bufferRowForScreenRow(clickedScreenRow)
+    clickedLineScreenRange = @editor.screenRangeForBufferRange([[clickedBufferRow, 0], [clickedBufferRow + 1, 0]])
 
-  onGutterMetaClick: (event) ->
-    {editor} = @props
-    clickedRow = @screenPositionForMouseEvent(event).row
-
-    bufferRange = editor.bufferRangeForScreenRange([[clickedRow, 0], [clickedRow + 1, 0]])
-    rowSelection = editor.addSelectionForBufferRange(bufferRange, preserveFolds: true)
-
-    @handleDragUntilMouseUp event, (screenPosition) ->
-      dragRow = screenPosition.row
-
-      if dragRow < clickedRow # dragging up
-        rowSelection.setScreenRange([[dragRow, 0], [clickedRow + 1, 0]], preserveFolds: true)
-      else
-        rowSelection.setScreenRange([[clickedRow, 0], [dragRow + 1, 0]], preserveFolds: true)
-
-      # After updating the selected screen range, merge overlapping selections
-      editor.mergeIntersectingSelections(preserveFolds: true)
-
-      # The merge process will possibly destroy the current selection because
-      # it will be merged into another one. Therefore, we need to obtain a
-      # reference to the new selection that contains the originally selected row
-      rowSelection = _.find editor.getSelections(), (selection) ->
-        selection.intersectsBufferRange(bufferRange)
-
-  onGutterShiftClick: (event) ->
-    {editor} = @props
-    clickedRow = @screenPositionForMouseEvent(event).row
-    tailPosition = editor.getLastSelection().getTailScreenPosition()
-
-    if clickedRow < tailPosition.row
-      editor.selectToScreenPosition([clickedRow, 0])
+    if clickedScreenRow < tailScreenPosition.row
+      @editor.selectToScreenPosition(clickedLineScreenRange.start, suppressSelectionMerge: true, autoscroll: false)
     else
-      editor.selectToScreenPosition([clickedRow + 1, 0])
+      @editor.selectToScreenPosition(clickedLineScreenRange.end, suppressSelectionMerge: true, autoscroll: false)
 
-    @handleDragUntilMouseUp event, (screenPosition) ->
+    @handleGutterDrag(new Range(tailScreenPosition, tailScreenPosition))
+
+  handleGutterDrag: (initialRange) ->
+    @handleDragUntilMouseUp (screenPosition) =>
       dragRow = screenPosition.row
-      if dragRow < tailPosition.row # dragging up
-        editor.setSelectedScreenRange([[dragRow, 0], tailPosition], preserveFolds: true)
+      if dragRow < initialRange.start.row
+        startPosition = @editor.clipScreenPosition([dragRow, 0], skipSoftWrapIndentation: true)
+        screenRange = new Range(startPosition, startPosition).union(initialRange)
+        @editor.getLastSelection().setScreenRange(screenRange, reversed: true, autoscroll: false, preserveFolds: true)
       else
-        editor.setSelectedScreenRange([tailPosition, [dragRow + 1, 0]], preserveFolds: true)
+        endPosition = [dragRow + 1, 0]
+        screenRange = new Range(endPosition, endPosition).union(initialRange)
+        @editor.getLastSelection().setScreenRange(screenRange, reversed: false, autoscroll: false, preserveFolds: true)
 
-  onStylesheetsChanged: (stylesheet) ->
+  onStylesheetsChanged: (styleElement) =>
     return unless @performedInitialMeasurement
-    return unless atom.themes.isInitialLoadComplete()
+    return unless @themes.isInitialLoadComplete()
 
-    @refreshScrollbars() if not stylesheet? or @containsScrollbarSelector(stylesheet)
+    # This delay prevents the styling from going haywire when stylesheets are
+    # reloaded in dev mode. It seems like a workaround for a browser bug, but
+    # not totally sure.
+
+    unless @stylingChangeAnimationFrameRequested
+      @stylingChangeAnimationFrameRequested = true
+      requestAnimationFrame =>
+        @stylingChangeAnimationFrameRequested = false
+        if @mounted
+          @refreshScrollbars() if not styleElement.sheet? or @containsScrollbarSelector(styleElement.sheet)
+          @handleStylingChange()
+
+  onAllThemesLoaded: =>
+    @refreshScrollbars()
+    @handleStylingChange()
+
+  handleStylingChange: =>
     @sampleFontStyling()
     @sampleBackgroundColors()
-    @remeasureCharacterWidths()
+    @invalidateCharacterWidths()
 
-  onScreenLinesChanged: (change) ->
-    {editor} = @props
-    @pendingChanges.push(change)
-    @requestUpdate() if editor.intersectsVisibleRowRange(change.start, change.end + 1) # TODO: Use closed-open intervals for change events
-
-  onSelectionAdded: (selection) ->
-    {editor} = @props
-
-    @subscribe selection.onDidChangeRange => @onSelectionChanged(selection)
-    @subscribe selection.onDidDestroy =>
-      @onSelectionChanged(selection)
-      @unsubscribe(selection)
-
-    if editor.selectionIntersectsVisibleRowRange(selection)
-      @selectionChanged = true
-      @requestUpdate()
-
-  onSelectionChanged: (selection) ->
-    {editor} = @props
-    if editor.selectionIntersectsVisibleRowRange(selection)
-      @selectionChanged = true
-      @requestUpdate()
-
-  onScrollTopChanged: ->
-    @scrollingVertically = true
-    @requestUpdate()
-    @onStoppedScrollingAfterDelay ?= debounce(@onStoppedScrolling, 200)
-    @onStoppedScrollingAfterDelay()
-
-  onStoppedScrolling: ->
-    return unless @isMounted()
-
-    @scrollingVertically = false
-    @mouseWheelScreenRow = null
-    @requestUpdate()
-
-  onStoppedScrollingAfterDelay: null # created lazily
-
-  onCursorAdded: (cursor) ->
-    @subscribe cursor.onDidChangePosition @onCursorMoved
-
-  onCursorMoved: ->
-    @cursorMoved = true
-    @requestUpdate()
-
-  onDecorationAdded: (decoration) ->
-    @subscribe decoration.onDidChangeProperties(@onDecorationChanged)
-    @subscribe decoration.getMarker().onDidChange(@onDecorationChanged)
-    @requestUpdate()
-
-  onDecorationChanged: ->
-    @requestUpdate()
-
-  onDecorationRemoved: ->
-    @requestUpdate()
-
-  onCharacterWidthsChanged: (@scopedCharacterWidthsChangeCount) ->
-    @requestUpdate()
-
-  onPlaceholderTextChanged: ->
-    @requestUpdate()
-
-  handleDragUntilMouseUp: (event, dragHandler) ->
-    {editor} = @props
+  handleDragUntilMouseUp: (dragHandler) ->
     dragging = false
     lastMousePosition = {}
     animationLoop = =>
       @requestAnimationFrame =>
-        if dragging
-          screenPosition = @screenPositionForMouseEvent(lastMousePosition)
+        if dragging and @mounted
+          linesClientRect = @linesComponent.getDomNode().getBoundingClientRect()
+          autoscroll(lastMousePosition, linesClientRect)
+          screenPosition = @screenPositionForMouseEvent(lastMousePosition, linesClientRect)
           dragHandler(screenPosition)
           animationLoop()
+        else if not @mounted
+          stopDragging()
 
     onMouseMove = (event) ->
       lastMousePosition.clientX = event.clientX
@@ -689,36 +596,75 @@ TextEditorComponent = React.createClass
       # Stop dragging when cursor enters dev tools because we can't detect mouseup
       onMouseUp() if event.which is 0
 
-    onMouseUp = ->
+    onMouseUp = (event) =>
+      if dragging
+        stopDragging()
+        @editor.finalizeSelections()
+        @editor.mergeIntersectingSelections()
+      pasteSelectionClipboard(event)
+
+    stopDragging = ->
       dragging = false
       window.removeEventListener('mousemove', onMouseMove)
       window.removeEventListener('mouseup', onMouseUp)
-      editor.finalizeSelections()
+      disposables.dispose()
+
+    autoscroll = (mouseClientPosition) =>
+      {top, bottom, left, right} = @scrollViewNode.getBoundingClientRect()
+      top += 30
+      bottom -= 30
+      left += 30
+      right -= 30
+
+      if mouseClientPosition.clientY < top
+        mouseYDelta = top - mouseClientPosition.clientY
+        yDirection = -1
+      else if mouseClientPosition.clientY > bottom
+        mouseYDelta = mouseClientPosition.clientY - bottom
+        yDirection = 1
+
+      if mouseClientPosition.clientX < left
+        mouseXDelta = left - mouseClientPosition.clientX
+        xDirection = -1
+      else if mouseClientPosition.clientX > right
+        mouseXDelta = mouseClientPosition.clientX - right
+        xDirection = 1
+
+      if mouseYDelta?
+        @presenter.setScrollTop(@presenter.getScrollTop() + yDirection * scaleScrollDelta(mouseYDelta))
+        @presenter.commitPendingScrollTopPosition()
+
+      if mouseXDelta?
+        @presenter.setScrollLeft(@presenter.getScrollLeft() + xDirection * scaleScrollDelta(mouseXDelta))
+        @presenter.commitPendingScrollLeftPosition()
+
+    scaleScrollDelta = (scrollDelta) ->
+      Math.pow(scrollDelta / 2, 3) / 280
+
+    pasteSelectionClipboard = (event) =>
+      if event?.which is 2 and process.platform is 'linux'
+        if selection = require('./safe-clipboard').readText('selection')
+          @editor.insertText(selection)
 
     window.addEventListener('mousemove', onMouseMove)
     window.addEventListener('mouseup', onMouseUp)
+    disposables = new CompositeDisposable
+    disposables.add(@editor.getBuffer().onWillChange(onMouseUp))
+    disposables.add(@editor.onDidDestroy(stopDragging))
 
   isVisible: ->
-    node = @getDOMNode()
-    node.offsetHeight > 0 or node.offsetWidth > 0
+    # Investigating an exception that occurs here due to ::domNode being null.
+    @assert @domNode?, "TextEditorComponent::domNode was null.", (error) =>
+      error.metadata = {@initialized}
 
-  pauseDOMPolling: ->
-    @domPollingPaused = true
-    @resumeDOMPollingAfterDelay ?= debounce(@resumeDOMPolling, 100)
-    @resumeDOMPollingAfterDelay()
+    @domNode? and (@domNode.offsetHeight > 0 or @domNode.offsetWidth > 0)
 
-  resumeDOMPolling: ->
-    @domPollingPaused = false
-
-  resumeDOMPollingAfterDelay: null # created lazily
-
-  pollDOM: ->
-    return if @domPollingPaused or @updateRequested or not @isMounted()
-
+  pollDOM: =>
     unless @checkForVisibilityChange()
       @sampleBackgroundColors()
-      @measureHeightAndWidth()
+      @measureDimensions()
       @sampleFontStyling()
+      @overlayManager?.measureOverlays()
 
   checkForVisibilityChange: ->
     if @isVisible()
@@ -730,43 +676,43 @@ TextEditorComponent = React.createClass
     else
       @wasVisible = false
 
-  requestHeightAndWidthMeasurement: ->
-    return if @heightAndWidthMeasurementRequested
-
-    @heightAndWidthMeasurementRequested = true
-    requestAnimationFrame =>
-      @heightAndWidthMeasurementRequested = false
-      @measureHeightAndWidth()
-
   # Measure explicitly-styled height and width and relay them to the model. If
   # these values aren't explicitly styled, we assume the editor is unconstrained
   # and use the scrollHeight / scrollWidth as its height and width in
   # calculations.
-  measureHeightAndWidth: ->
-    return unless @isMounted()
+  measureDimensions: ->
+    return unless @mounted
 
-    {editor, parentView} = @props
-    scrollViewNode = @refs.scrollView.getDOMNode()
-    {position} = getComputedStyle(parentView)
-    {height} = parentView.style
+    {position} = getComputedStyle(@hostElement)
+    {height} = @hostElement.style
 
     if position is 'absolute' or height
-      if @autoHeight
-        @autoHeight = false
-        @forceUpdate() unless @updatesPaused
-
-      clientHeight =  scrollViewNode.clientHeight
-      editor.setHeight(clientHeight) if clientHeight > 0
+      @presenter.setAutoHeight(false)
+      height =  @hostElement.offsetHeight
+      if height > 0
+        @presenter.setExplicitHeight(height)
     else
-      editor.setHeight(null)
-      @autoHeight = true
+      @presenter.setAutoHeight(true)
+      @presenter.setExplicitHeight(null)
 
-    clientWidth = scrollViewNode.clientWidth
-    paddingLeft = parseInt(getComputedStyle(scrollViewNode).paddingLeft)
+    clientWidth = @scrollViewNode.clientWidth
+    paddingLeft = parseInt(getComputedStyle(@scrollViewNode).paddingLeft)
     clientWidth -= paddingLeft
-    editor.setWidth(clientWidth) if clientWidth > 0
+    if clientWidth > 0
+      @presenter.setContentFrameWidth(clientWidth)
 
-  sampleFontStyling: ->
+    @presenter.setGutterWidth(@gutterContainerComponent?.getDomNode().offsetWidth ? 0)
+    @presenter.setBoundingClientRect(@hostElement.getBoundingClientRect())
+
+  measureWindowSize: ->
+    return unless @mounted
+
+    # FIXME: on Ubuntu (via xvfb) `window.innerWidth` reports an incorrect value
+    # when window gets resized through `atom.setWindowDimensions({width:
+    # windowWidth, height: windowHeight})`.
+    @presenter.setWindowSize(window.innerWidth, window.innerHeight)
+
+  sampleFontStyling: =>
     oldFontSize = @fontSize
     oldFontFamily = @fontFamily
     oldLineHeight = @lineHeight
@@ -774,45 +720,31 @@ TextEditorComponent = React.createClass
     {@fontSize, @fontFamily, @lineHeight} = getComputedStyle(@getTopmostDOMNode())
 
     if @fontSize isnt oldFontSize or @fontFamily isnt oldFontFamily or @lineHeight isnt oldLineHeight
+      @clearPoolAfterUpdate = true
       @measureLineHeightAndDefaultCharWidth()
-
-    if (@fontSize isnt oldFontSize or @fontFamily isnt oldFontFamily) and @performedInitialMeasurement
-      @remeasureCharacterWidths()
+      @invalidateCharacterWidths()
 
   sampleBackgroundColors: (suppressUpdate) ->
-    {parentView} = @props
-    {showLineNumbers} = @state
-    {backgroundColor} = getComputedStyle(parentView)
+    {backgroundColor} = getComputedStyle(@hostElement)
 
-    if backgroundColor isnt @backgroundColor
-      @backgroundColor = backgroundColor
-      @requestUpdate() unless suppressUpdate
+    @presenter.setBackgroundColor(backgroundColor)
 
-    if @shouldRenderGutter()
-      gutterBackgroundColor = getComputedStyle(@refs.gutter.getDOMNode()).backgroundColor
-      if gutterBackgroundColor isnt @gutterBackgroundColor
-        @gutterBackgroundColor = gutterBackgroundColor
-        @requestUpdate() unless suppressUpdate
+    lineNumberGutter = @gutterContainerComponent?.getLineNumberGutterComponent()
+    if lineNumberGutter
+      gutterBackgroundColor = getComputedStyle(lineNumberGutter.getDomNode()).backgroundColor
+      @presenter.setGutterBackgroundColor(gutterBackgroundColor)
 
   measureLineHeightAndDefaultCharWidth: ->
     if @isVisible()
       @measureLineHeightAndDefaultCharWidthWhenShown = false
-      @refs.lines.measureLineHeightAndDefaultCharWidth()
+      @linesComponent.measureLineHeightAndDefaultCharWidth()
     else
       @measureLineHeightAndDefaultCharWidthWhenShown = true
-
-  remeasureCharacterWidths: ->
-    if @isVisible()
-      @remeasureCharacterWidthsWhenShown = false
-      @refs.lines.remeasureCharacterWidths()
-    else
-      @remeasureCharacterWidthsWhenShown = true
 
   measureScrollbars: ->
     @measureScrollbarsWhenShown = false
 
-    {editor} = @props
-    cornerNode = @refs.scrollbarCorner.getDOMNode()
+    cornerNode = @scrollbarCornerComponent.getDomNode()
     originalDisplayValue = cornerNode.style.display
 
     cornerNode.style.display = 'block'
@@ -820,8 +752,8 @@ TextEditorComponent = React.createClass
     width = (cornerNode.offsetWidth - cornerNode.clientWidth) or 15
     height = (cornerNode.offsetHeight - cornerNode.clientHeight) or 15
 
-    editor.setVerticalScrollbarWidth(width)
-    editor.setHorizontalScrollbarHeight(height)
+    @presenter.setVerticalScrollbarWidth(width)
+    @presenter.setHorizontalScrollbarHeight(height)
 
     cornerNode.style.display = originalDisplayValue
 
@@ -831,18 +763,16 @@ TextEditorComponent = React.createClass
         return true
     false
 
-  refreshScrollbars: ->
+  refreshScrollbars: =>
     if @isVisible()
       @measureScrollbarsWhenShown = false
     else
       @measureScrollbarsWhenShown = true
       return
 
-    {verticalScrollbar, horizontalScrollbar, scrollbarCorner} = @refs
-
-    verticalNode = verticalScrollbar.getDOMNode()
-    horizontalNode = horizontalScrollbar.getDOMNode()
-    cornerNode = scrollbarCorner.getDOMNode()
+    verticalNode = @verticalScrollbarComponent.getDomNode()
+    horizontalNode = @horizontalScrollbarComponent.getDomNode()
+    cornerNode = @scrollbarCornerComponent.getDomNode()
 
     originalVerticalDisplayValue = verticalNode.style.display
     originalHorizontalDisplayValue = horizontalNode.style.display
@@ -866,25 +796,34 @@ TextEditorComponent = React.createClass
     horizontalNode.style.display = originalHorizontalDisplayValue
     cornerNode.style.display = originalCornerDisplayValue
 
-  clearMouseWheelScreenRow: ->
-    if @mouseWheelScreenRow?
-      @mouseWheelScreenRow = null
-      @requestUpdate()
-
-  clearMouseWheelScreenRowAfterDelay: null # created lazily
-
   consolidateSelections: (e) ->
-    e.abortKeyBinding() unless @props.editor.consolidateSelections()
+    e.abortKeyBinding() unless @editor.consolidateSelections()
 
-  lineNodeForScreenRow: (screenRow) -> @refs.lines.lineNodeForScreenRow(screenRow)
+  lineNodeForScreenRow: (screenRow) ->
+    tileRow = @presenter.tileForRow(screenRow)
+    tileComponent = @linesComponent.getComponentForTile(tileRow)
 
-  lineNumberNodeForScreenRow: (screenRow) -> @refs.gutter.lineNumberNodeForScreenRow(screenRow)
+    tileComponent?.lineNodeForScreenRow(screenRow)
+
+  lineNumberNodeForScreenRow: (screenRow) ->
+    tileRow = @presenter.tileForRow(screenRow)
+    gutterComponent = @gutterContainerComponent.getLineNumberGutterComponent()
+    tileComponent = gutterComponent.getComponentForTile(tileRow)
+
+    tileComponent?.lineNumberNodeForScreenRow(screenRow)
+
+  tileNodesForLines: ->
+    @linesComponent.getTiles()
+
+  tileNodesForLineNumbers: ->
+    gutterComponent = @gutterContainerComponent.getLineNumberGutterComponent()
+    gutterComponent.getTiles()
 
   screenRowForNode: (node) ->
-    while node isnt document
+    while node?
       if screenRow = node.dataset.screenRow
         return parseInt(screenRow)
-      node = node.parentNode
+      node = node.parentElement
     null
 
   getFontSize: ->
@@ -893,6 +832,7 @@ TextEditorComponent = React.createClass
   setFontSize: (fontSize) ->
     @getTopmostDOMNode().style.fontSize = fontSize + 'px'
     @sampleFontStyling()
+    @invalidateCharacterWidths()
 
   getFontFamily: ->
     getComputedStyle(@getTopmostDOMNode()).fontFamily
@@ -900,94 +840,58 @@ TextEditorComponent = React.createClass
   setFontFamily: (fontFamily) ->
     @getTopmostDOMNode().style.fontFamily = fontFamily
     @sampleFontStyling()
+    @invalidateCharacterWidths()
 
   setLineHeight: (lineHeight) ->
     @getTopmostDOMNode().style.lineHeight = lineHeight
     @sampleFontStyling()
+    @invalidateCharacterWidths()
+
+  invalidateCharacterWidths: ->
+    @linesYardstick.invalidateCache()
+    @presenter.characterWidthsChanged()
 
   setShowIndentGuide: (showIndentGuide) ->
-    @setState({showIndentGuide})
+    @config.set("editor.showIndentGuide", showIndentGuide)
 
-  # Deprecated
-  setInvisibles: (invisibles={}) ->
-    grim.deprecate "Use config.set('editor.invisibles', invisibles) instead"
-    atom.config.set('editor.invisibles', invisibles)
-
-  # Deprecated
-  setShowInvisibles: (showInvisibles) ->
-    atom.config.set('editor.showInvisibles', showInvisibles)
-
-  setShowLineNumbers: (showLineNumbers) ->
-    @setState({showLineNumbers})
-
-  setScrollSensitivity: (scrollSensitivity) ->
+  setScrollSensitivity: (scrollSensitivity) =>
     if scrollSensitivity = parseInt(scrollSensitivity)
       @scrollSensitivity = Math.abs(scrollSensitivity) / 100
 
-  setUseHardwareAcceleration: (useHardwareAcceleration=true) ->
-    unless @useHardwareAcceleration is useHardwareAcceleration
-      @useHardwareAcceleration = useHardwareAcceleration
-      @requestUpdate()
+  screenPositionForMouseEvent: (event, linesClientRect) ->
+    pixelPosition = @pixelPositionForMouseEvent(event, linesClientRect)
+    @screenPositionForPixelPosition(pixelPosition, true)
 
-  screenPositionForMouseEvent: (event) ->
-    pixelPosition = @pixelPositionForMouseEvent(event)
-    @props.editor.screenPositionForPixelPosition(pixelPosition)
-
-  pixelPositionForMouseEvent: (event) ->
-    {editor} = @props
+  pixelPositionForMouseEvent: (event, linesClientRect) ->
     {clientX, clientY} = event
 
-    linesClientRect = @refs.lines.getDOMNode().getBoundingClientRect()
-    top = clientY - linesClientRect.top
-    left = clientX - linesClientRect.left
-    {top, left}
+    linesClientRect ?= @linesComponent.getDomNode().getBoundingClientRect()
+    top = clientY - linesClientRect.top + @presenter.getRealScrollTop()
+    left = clientX - linesClientRect.left + @presenter.getRealScrollLeft()
+    bottom = linesClientRect.top + @presenter.getRealScrollTop() + linesClientRect.height - clientY
+    right = linesClientRect.left + @presenter.getRealScrollLeft() + linesClientRect.width - clientX
+
+    {top, left, bottom, right}
+
+  getGutterWidth: ->
+    @presenter.getGutterWidth()
 
   getModel: ->
-    @props.editor
+    @editor
 
   isInputEnabled: -> @inputEnabled
 
   setInputEnabled: (@inputEnabled) -> @inputEnabled
 
-  updateParentViewFocusedClassIfNeeded: (prevState) ->
-    if prevState.focused isnt @state.focused
-      @props.parentView.classList.toggle('is-focused', @state.focused)
+  setContinuousReflow: (continuousReflow) ->
+    @presenter.setContinuousReflow(continuousReflow)
 
-  updateParentViewMiniClassIfNeeded: (prevProps) ->
-    if prevProps.mini isnt @props.mini
-      @props.parentView.classList.toggle('mini', @props.mini)
+  updateParentViewFocusedClassIfNeeded: ->
+    if @oldState.focused isnt @newState.focused
+      @hostElement.classList.toggle('is-focused', @newState.focused)
+      @rootElement.classList.toggle('is-focused', @newState.focused)
+      @oldState.focused = @newState.focused
 
-  runScrollBenchmark: ->
-    unless process.env.NODE_ENV is 'production'
-      ReactPerf = require 'react-atom-fork/lib/ReactDefaultPerf'
-      ReactPerf.start()
-
-    node = @getDOMNode()
-
-    scroll = (delta, done) ->
-      dispatchMouseWheelEvent = ->
-        node.dispatchEvent(new WheelEvent('mousewheel', wheelDeltaX: -0, wheelDeltaY: -delta))
-
-      stopScrolling = ->
-        clearInterval(interval)
-        done?()
-
-      interval = setInterval(dispatchMouseWheelEvent, 10)
-      setTimeout(stopScrolling, 500)
-
-    console.timeline('scroll')
-    scroll 50, ->
-      scroll 100, ->
-        scroll 200, ->
-          scroll 400, ->
-            scroll 800, ->
-              scroll 1600, ->
-                console.timelineEnd('scroll')
-                unless process.env.NODE_ENV is 'production'
-                  ReactPerf.stop()
-                  console.log "Inclusive"
-                  ReactPerf.printInclusive()
-                  console.log "Exclusive"
-                  ReactPerf.printExclusive()
-                  console.log "Wasted"
-                  ReactPerf.printWasted()
+  updateParentViewMiniClass: ->
+    @hostElement.classList.toggle('mini', @editor.isMini())
+    @rootElement.classList.toggle('mini', @editor.isMini())

@@ -1,34 +1,60 @@
-{$} = require './space-pen-extensions'
 _ = require 'underscore-plus'
-remote = require 'remote'
 path = require 'path'
 CSON = require 'season'
 fs = require 'fs-plus'
-{specificity} = require 'clear-cut'
+{calculateSpecificity, validateSelector} = require 'clear-cut'
 {Disposable} = require 'event-kit'
-Grim = require 'grim'
+remote = require 'remote'
 MenuHelpers = require './menu-helpers'
 
-SpecificityCache = {}
+platformContextMenu = require('../package.json')?._atomMenu?['context-menu']
 
 # Extended: Provides a registry for commands that you'd like to appear in the
 # context menu.
 #
 # An instance of this class is always available as the `atom.contextMenu`
 # global.
+#
+# ## Context Menu CSON Format
+#
+# ```coffee
+# 'atom-workspace': [{label: 'Help', command: 'application:open-documentation'}]
+# 'atom-text-editor': [{
+#   label: 'History',
+#   submenu: [
+#     {label: 'Undo', command:'core:undo'}
+#     {label: 'Redo', command:'core:redo'}
+#   ]
+# }]
+# ```
+#
+# In your package's menu `.cson` file you need to specify it under a
+# `context-menu` key:
+#
+# ```coffee
+# 'context-menu':
+#   'atom-workspace': [{label: 'Help', command: 'application:open-documentation'}]
+#   ...
+# ```
+#
+# The format for use in {::add} is the same minus the `context-menu` key. See
+# {::add} for more information.
 module.exports =
 class ContextMenuManager
-  constructor: ({@resourcePath, @devMode}) ->
+  constructor: ({@resourcePath, @devMode, @keymapManager}) ->
     @definitions = {'.overlayer': []} # TODO: Remove once color picker package stops touching private data
     @clear()
 
-    atom.keymaps.onDidLoadBundledKeymaps => @loadPlatformItems()
+    @keymapManager.onDidLoadBundledKeymaps => @loadPlatformItems()
 
   loadPlatformItems: ->
-    menusDirPath = path.join(@resourcePath, 'menus')
-    platformMenuPath = fs.resolve(menusDirPath, process.platform, ['cson', 'json'])
-    map = CSON.readFileSync(platformMenuPath)
-    atom.contextMenu.add(map['context-menu'])
+    if platformContextMenu?
+      @add(platformContextMenu)
+    else
+      menusDirPath = path.join(@resourcePath, 'menus')
+      platformMenuPath = fs.resolve(menusDirPath, process.platform, ['cson', 'json'])
+      map = CSON.readFileSync(platformMenuPath)
+      @add(map['context-menu'])
 
   # Public: Add context menu items scoped by CSS selectors.
   #
@@ -42,12 +68,12 @@ class ContextMenuManager
   #
   # ```coffee
   # atom.contextMenu.add {
-  #   '.workspace': [{label: 'Help', command: 'application:open-documentation'}]
-  #   '.editor':    [{
+  #   'atom-workspace': [{label: 'Help', command: 'application:open-documentation'}]
+  #   'atom-text-editor': [{
   #     label: 'History',
   #     submenu: [
-  #       {label: 'Undo': command:'core:undo'}
-  #       {label: 'Redo': command:'core:redo'}
+  #       {label: 'Undo', command:'core:undo'}
+  #       {label: 'Redo', command:'core:redo'}
   #     ]
   #   }]
   # }
@@ -57,39 +83,36 @@ class ContextMenuManager
   #
   # * `itemsBySelector` An {Object} whose keys are CSS selectors and whose
   #   values are {Array}s of item {Object}s containing the following keys:
-  #   * `label` (Optional) A {String} containing the menu item's label.
-  #   * `command` (Optional) A {String} containing the command to invoke on the
+  #   * `label` (optional) A {String} containing the menu item's label.
+  #   * `command` (optional) A {String} containing the command to invoke on the
   #     target of the right click that invoked the context menu.
-  #   * `submenu` (Optional) An {Array} of additional items.
-  #   * `type` (Optional) If you want to create a separator, provide an item
+  #   * `enabled` (optional) A {Boolean} indicating whether the menu item
+  #     should be clickable. Disabled menu items typically appear grayed out.
+  #     Defaults to `true`.
+  #   * `submenu` (optional) An {Array} of additional items.
+  #   * `type` (optional) If you want to create a separator, provide an item
   #      with `type: 'separator'` and no other keys.
-  #   * `created` (Optional) A {Function} that is called on the item each time a
+  #   * `visible` (optional) A {Boolean} indicating whether the menu item
+  #     should appear in the menu. Defaults to `true`.
+  #   * `created` (optional) A {Function} that is called on the item each time a
   #     context menu is created via a right click. You can assign properties to
   #    `this` to dynamically compute the command, label, etc. This method is
   #    actually called on a clone of the original item template to prevent state
   #    from leaking across context menu deployments. Called with the following
   #    argument:
   #     * `event` The click event that deployed the context menu.
-  #   * `shouldDisplay` (Optional) A {Function} that is called to determine
+  #   * `shouldDisplay` (optional) A {Function} that is called to determine
   #     whether to display this item on a given context menu deployment. Called
   #     with the following argument:
   #     * `event` The click event that deployed the context menu.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to remove the
+  # added menu items.
   add: (itemsBySelector) ->
-    # Detect deprecated file path as first argument
-    unless typeof itemsBySelector is 'object'
-      Grim.deprecate("ContextMenuManage::add has changed to take a single object as its argument. Please consult the documentation.")
-      itemsBySelector = arguments[1]
-      devMode = arguments[2]?.devMode
-
-    # Detect deprecated format for items object
-    for key, value of itemsBySelector
-      unless _.isArray(value)
-        Grim.deprecate("The format for declaring context menu items has changed. Please consult the documentation.")
-        itemsBySelector = @convertLegacyItemsBySelector(itemsBySelector, devMode)
-
     addedItemSets = []
 
     for selector, items of itemsBySelector
+      validateSelector(selector)
       itemSet = new ContextMenuItemSet(selector, items)
       addedItemSets.push(itemSet)
       @itemSets.push(itemSet)
@@ -97,6 +120,7 @@ class ContextMenuManager
     new Disposable =>
       for itemSet in addedItemSets
         @itemSets.splice(@itemSets.indexOf(itemSet), 1)
+      return
 
   templateForElement: (target) ->
     @templateForEvent({target})
@@ -147,9 +171,6 @@ class ContextMenuManager
 
     items
 
-  # Public: Request a context menu to be displayed.
-  #
-  # * `event` A DOM event.
   showForEvent: (event) ->
     @activeElement = event.target
     menuTemplate = @templateForEvent(event)
@@ -161,7 +182,7 @@ class ContextMenuManager
   clear: ->
     @activeElement = null
     @itemSets = []
-    @add '.workspace': [{
+    @add 'atom-workspace': [{
       label: 'Inspect Element'
       command: 'application:inspect'
       devMode: true
@@ -172,4 +193,4 @@ class ContextMenuManager
 
 class ContextMenuItemSet
   constructor: (@selector, @items) ->
-    @specificity = (SpecificityCache[@selector] ?= specificity(@selector))
+    @specificity = calculateSpecificity(@selector)

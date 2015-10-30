@@ -1,6 +1,4 @@
 {CompositeDisposable} = require 'event-kit'
-{callAttachHooks} = require './space-pen-extensions'
-PaneContainerView = null
 _ = require 'underscore-plus'
 
 module.exports =
@@ -8,20 +6,19 @@ class PaneContainerElement extends HTMLElement
   createdCallback: ->
     @subscriptions = new CompositeDisposable
     @classList.add 'panes'
-    PaneContainerView ?= require './pane-container-view'
-    @__spacePenView = new PaneContainerView(this)
 
-  setModel: (@model) ->
+  initialize: (@model, {@views}) ->
+    throw new Error("Must pass a views parameter when initializing PaneContainerElements") unless @views?
+
     @subscriptions.add @model.observeRoot(@rootChanged.bind(this))
-    @__spacePenView.setModel(@model)
+    this
 
   rootChanged: (root) ->
     focusedElement = document.activeElement if @hasFocus()
     @firstChild?.remove()
     if root?
-      view = @model.getView(root)
+      view = @views.getView(root)
       @appendChild(view)
-      callAttachHooks(view)
       focusedElement?.focus()
 
   hasFocus: ->
@@ -45,10 +42,10 @@ class PaneContainerElement extends HTMLElement
       y = pointB.y - pointA.y
       Math.sqrt(Math.pow(x, 2) + Math.pow(y, 2))
 
-    paneView = @model.getView(@model.getActivePane())
+    paneView = @views.getView(@model.getActivePane())
     box = @boundingBoxForPaneView(paneView)
 
-    paneViews = _.toArray(@querySelectorAll('.pane'))
+    paneViews = _.toArray(@querySelectorAll('atom-pane'))
       .filter (otherPaneView) =>
         otherBox = @boundingBoxForPaneView(otherPaneView)
         switch direction
@@ -75,6 +72,4 @@ class PaneContainerElement extends HTMLElement
     top: {x: boundingBox.left, y: boundingBox.top}
     bottom: {x: boundingBox.left, y: boundingBox.bottom}
 
-module.exports = PaneContainerElement = document.registerElement 'atom-pane-container',
-  prototype: PaneContainerElement.prototype
-  extends: 'div'
+module.exports = PaneContainerElement = document.registerElement 'atom-pane-container', prototype: PaneContainerElement.prototype

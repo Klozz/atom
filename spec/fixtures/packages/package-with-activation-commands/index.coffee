@@ -6,8 +6,9 @@ module.exports =
   activate: ->
     @activateCallCount++
 
-    atom.commands.add '.workspace', 'activation-command', =>
+    atom.commands.add 'atom-workspace', 'activation-command', =>
       @activationCommandCallCount++
 
-    atom.workspaceView.getActiveView()?.command 'activation-command', =>
+    editorView = atom.views.getView(atom.workspace.getActiveTextEditor())?.__spacePenView
+    editorView?.command 'activation-command', =>
       @legacyActivationCommandCallCount++

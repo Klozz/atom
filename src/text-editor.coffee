@@ -1,22 +1,22 @@
 _ = require 'underscore-plus'
 path = require 'path'
-Serializable = require 'serializable'
-Delegator = require 'delegato'
-{deprecate} = require 'grim'
-{Model} = require 'theorist'
-EmitterMixin = require('emissary').Emitter
-{Emitter} = require 'event-kit'
-{Point, Range} = require 'text-buffer'
+Grim = require 'grim'
+{CompositeDisposable, Emitter} = require 'event-kit'
+{Point, Range} = TextBuffer = require 'text-buffer'
 LanguageMode = require './language-mode'
 DisplayBuffer = require './display-buffer'
 Cursor = require './cursor'
+Model = require './model'
 Selection = require './selection'
 TextMateScopeSelector = require('first-mate').ScopeSelector
+{Directory} = require "pathwatcher"
+GutterContainer = require './gutter-container'
 
-# Public: This class represents all essential editing state for a single
+# Essential: This class represents all essential editing state for a single
 # {TextBuffer}, including cursor and selection positions, folds, and soft wraps.
 # If you're manipulating the state of an editor, use this class. If you're
-# interested in the visual appearance of editors, use {TextEditorView} instead.
+# interested in the visual appearance of editors, use {TextEditorElement}
+# instead.
 #
 # A single {TextBuffer} can belong to multiple editors. For example, if the
 # same file is open in two different panes, Atom creates a separate editor for
@@ -54,13 +54,7 @@ TextMateScopeSelector = require('first-mate').ScopeSelector
 # soft wraps and folds to ensure your code interacts with them correctly.
 module.exports =
 class TextEditor extends Model
-  Serializable.includeInto(this)
-  atom.deserializers.add(this)
-  Delegator.includeInto(this)
-
-  deserializing: false
   callDisplayBufferCreatedHook: false
-  registerEditor: false
   buffer: null
   languageMode: null
   cursors: null
@@ -68,106 +62,125 @@ class TextEditor extends Model
   suppressSelectionMerging: false
   updateBatchDepth: 0
   selectionFlashDuration: 500
+  gutterContainer: null
 
-  @delegatesMethods 'suggestedIndentForBufferRow', 'autoIndentBufferRow', 'autoIndentBufferRows',
-    'autoDecreaseIndentForBufferRow', 'toggleLineCommentForBufferRow', 'toggleLineCommentsForBufferRows',
-    toProperty: 'languageMode'
+  @deserialize: (state, atomEnvironment) ->
+    try
+      displayBuffer = DisplayBuffer.deserialize(state.displayBuffer, atomEnvironment)
+    catch error
+      if error.syscall is 'read'
+        return # Error reading the file, don't deserialize an editor for it
+      else
+        throw error
 
-  @delegatesProperties '$lineHeightInPixels', '$defaultCharWidth', '$height', '$width',
-    '$verticalScrollbarWidth', '$horizontalScrollbarHeight', '$scrollTop', '$scrollLeft',
-    'manageScrollPosition', toProperty: 'displayBuffer'
+    state.displayBuffer = displayBuffer
+    state.config = atomEnvironment.config
+    state.notificationManager = atomEnvironment.notifications
+    state.packageManager = atomEnvironment.packages
+    state.clipboard = atomEnvironment.clipboard
+    state.viewRegistry = atomEnvironment.views
+    state.grammarRegistry = atomEnvironment.grammars
+    state.project = atomEnvironment.project
+    state.assert = atomEnvironment.assert.bind(atomEnvironment)
+    state.applicationDelegate = atomEnvironment.applicationDelegate
+    new this(state)
 
-  constructor: ({@softTabs, initialLine, initialColumn, tabLength, softWrapped, @displayBuffer, buffer, registerEditor, suppressCursorCreation, @mini, @placeholderText}) ->
+  constructor: (params={}) ->
     super
 
+    {
+      @softTabs, @scrollRow, @scrollColumn, initialLine, initialColumn, tabLength,
+      softWrapped, @displayBuffer, buffer, suppressCursorCreation, @mini, @placeholderText,
+      lineNumberGutterVisible, largeFileMode, @config, @notificationManager, @packageManager,
+      @clipboard, @viewRegistry, @grammarRegistry, @project, @assert, @applicationDelegate
+    } = params
+
+    throw new Error("Must pass a config parameter when constructing TextEditors") unless @config?
+    throw new Error("Must pass a notificationManager parameter when constructing TextEditors") unless @notificationManager?
+    throw new Error("Must pass a packageManager parameter when constructing TextEditors") unless @packageManager?
+    throw new Error("Must pass a clipboard parameter when constructing TextEditors") unless @clipboard?
+    throw new Error("Must pass a viewRegistry parameter when constructing TextEditors") unless @viewRegistry?
+    throw new Error("Must pass a grammarRegistry parameter when constructing TextEditors") unless @grammarRegistry?
+    throw new Error("Must pass a project parameter when constructing TextEditors") unless @project?
+    throw new Error("Must pass an assert parameter when constructing TextEditors") unless @assert?
+
     @emitter = new Emitter
+    @disposables = new CompositeDisposable
     @cursors = []
     @selections = []
 
-    if @shouldShowInvisibles()
-      invisibles = atom.config.get('editor.invisibles')
-
-    @displayBuffer?.setInvisibles(invisibles)
-    @displayBuffer ?= new DisplayBuffer({buffer, tabLength, softWrapped, invisibles})
+    buffer ?= new TextBuffer
+    @displayBuffer ?= new DisplayBuffer({
+      buffer, tabLength, softWrapped, ignoreInvisibles: @mini, largeFileMode,
+      @config, @assert, @grammarRegistry, @packageManager
+    })
     @buffer = @displayBuffer.buffer
-    @softTabs = @usesSoftTabs() ? @softTabs ? atom.config.get('editor.softTabs') ? true
 
     for marker in @findMarkers(@getSelectionMarkerAttributes())
       marker.setProperties(preserveFolds: true)
       @addSelection(marker)
 
+    @subscribeToTabTypeConfig()
     @subscribeToBuffer()
     @subscribeToDisplayBuffer()
 
-    if @getCursors().length is 0 and not suppressCursorCreation
+    if @cursors.length is 0 and not suppressCursorCreation
       initialLine = Math.max(parseInt(initialLine) or 0, 0)
       initialColumn = Math.max(parseInt(initialColumn) or 0, 0)
       @addCursorAtBufferPosition([initialLine, initialColumn])
 
-    @languageMode = new LanguageMode(this)
+    @languageMode = new LanguageMode(this, @config)
 
-    @subscribe @$scrollTop, (scrollTop) =>
-      @emit 'scroll-top-changed', scrollTop
-      @emitter.emit 'did-change-scroll-top', scrollTop
-    @subscribe @$scrollLeft, (scrollLeft) =>
-      @emit 'scroll-left-changed', scrollLeft
-      @emitter.emit 'did-change-scroll-left', scrollLeft
+    @setEncoding(@config.get('core.fileEncoding', scope: @getRootScopeDescriptor()))
 
-    @subscribe atom.config.onDidChange 'editor.showInvisibles', => @updateInvisibles()
-    @subscribe atom.config.onDidChange 'editor.invisibles', => @updateInvisibles()
+    @gutterContainer = new GutterContainer(this)
+    @lineNumberGutter = @gutterContainer.addGutter
+      name: 'line-number'
+      priority: 0
+      visible: lineNumberGutterVisible
 
-    atom.workspace?.editorAdded(this) if registerEditor
-
-  serializeParams: ->
+  serialize: ->
+    deserializer: 'TextEditor'
     id: @id
     softTabs: @softTabs
-    scrollTop: @scrollTop
-    scrollLeft: @scrollLeft
+    scrollRow: @getScrollRow()
+    scrollColumn: @getScrollColumn()
     displayBuffer: @displayBuffer.serialize()
-
-  deserializeParams: (params) ->
-    params.displayBuffer = DisplayBuffer.deserialize(params.displayBuffer)
-    params.registerEditor = true
-    params
 
   subscribeToBuffer: ->
     @buffer.retain()
-    @subscribe @buffer.onDidChangePath =>
-      unless atom.project.getPaths()[0]?
-        atom.project.setPaths([path.dirname(@getPath())])
-      @emit "title-changed"
+    @disposables.add @buffer.onDidChangePath =>
+      unless @project.getPaths().length > 0
+        @project.setPaths([path.dirname(@getPath())])
       @emitter.emit 'did-change-title', @getTitle()
-      @emit "path-changed"
       @emitter.emit 'did-change-path', @getPath()
-    @subscribe @buffer.onDidDestroy => @destroy()
-
-    # TODO: remove these thwne we remove the deprecations. They are old events.
-    @subscribe @buffer.onDidStopChanging => @emit "contents-modified"
-    @subscribe @buffer.onDidConflict => @emit "contents-conflicted"
-    @subscribe @buffer.onDidChangeModified => @emit "modified-status-changed"
+    @disposables.add @buffer.onDidChangeEncoding =>
+      @emitter.emit 'did-change-encoding', @getEncoding()
+    @disposables.add @buffer.onDidDestroy => @destroy()
 
     @preserveCursorPositionOnBufferReload()
 
   subscribeToDisplayBuffer: ->
-    @subscribe @displayBuffer.onDidCreateMarker @handleMarkerCreated
-    @subscribe @displayBuffer.onDidUpdateMarkers => @mergeIntersectingSelections()
-    @subscribe @displayBuffer.onDidChangeGrammar => @handleGrammarChange()
-    @subscribe @displayBuffer.onDidTokenize => @handleTokenization()
-    @subscribe @displayBuffer.onDidChange (e) =>
-      @emit 'screen-lines-changed', e
+    @disposables.add @displayBuffer.onDidCreateMarker @handleMarkerCreated
+    @disposables.add @displayBuffer.onDidChangeGrammar => @handleGrammarChange()
+    @disposables.add @displayBuffer.onDidTokenize => @handleTokenization()
+    @disposables.add @displayBuffer.onDidChange (e) =>
+      @mergeIntersectingSelections()
       @emitter.emit 'did-change', e
 
-    # TODO: remove these when we remove the deprecations. Though, no one is likely using them
-    @subscribe @displayBuffer.onDidChangeSoftWrapped (softWrapped) => @emit 'soft-wrap-changed', softWrapped
-    @subscribe @displayBuffer.onDidAddDecoration (decoration) => @emit 'decoration-added', decoration
-    @subscribe @displayBuffer.onDidRemoveDecoration (decoration) => @emit 'decoration-removed', decoration
+  subscribeToTabTypeConfig: ->
+    @tabTypeSubscription?.dispose()
+    @tabTypeSubscription = @config.observe 'editor.tabType', scope: @getRootScopeDescriptor(), =>
+      @softTabs = @shouldUseSoftTabs(defaultValue: @softTabs)
 
   destroyed: ->
-    @unsubscribe()
-    selection.destroy() for selection in @getSelections()
+    @disposables.dispose()
+    @tabTypeSubscription.dispose()
+    selection.destroy() for selection in @selections.slice()
     @buffer.release()
     @displayBuffer.destroy()
     @languageMode.destroy()
+    @gutterContainer.destroy()
     @emitter.emit 'did-destroy'
 
   ###
@@ -251,10 +264,31 @@ class TextEditor extends Model
   onDidChangeSoftWrapped: (callback) ->
     @displayBuffer.onDidChangeSoftWrapped(callback)
 
-  # Extended: Calls your `callback` when the grammar that interprets and colorizes the text has
-  # been changed.
+  # Extended: Calls your `callback` when the buffer's encoding has changed.
   #
   # * `callback` {Function}
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  onDidChangeEncoding: (callback) ->
+    @emitter.on 'did-change-encoding', callback
+
+  # Extended: Calls your `callback` when the grammar that interprets and
+  # colorizes the text has been changed. Immediately calls your callback with
+  # the current grammar.
+  #
+  # * `callback` {Function}
+  #   * `grammar` {Grammar}
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  observeGrammar: (callback) ->
+    callback(@getGrammar())
+    @onDidChangeGrammar(callback)
+
+  # Extended: Calls your `callback` when the grammar that interprets and
+  # colorizes the text has been changed.
+  #
+  # * `callback` {Function}
+  #   * `grammar` {Grammar}
   #
   # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
   onDidChangeGrammar: (callback) ->
@@ -288,7 +322,7 @@ class TextEditor extends Model
   onWillInsertText: (callback) ->
     @emitter.on 'will-insert-text', callback
 
-  # Extended: Calls your `callback` adter text has been inserted.
+  # Extended: Calls your `callback` after text has been inserted.
   #
   # * `callback` {Function}
   #   * `event` event {Object}
@@ -298,7 +332,7 @@ class TextEditor extends Model
   onDidInsertText: (callback) ->
     @emitter.on 'did-insert-text', callback
 
-  # Public: Invoke the given callback after the buffer is saved to disk.
+  # Essential: Invoke the given callback after the buffer is saved to disk.
   #
   # * `callback` {Function} to be called after the buffer is saved.
   #   * `event` {Object} with the following keys:
@@ -308,7 +342,7 @@ class TextEditor extends Model
   onDidSave: (callback) ->
     @getBuffer().onDidSave(callback)
 
-  # Public: Invoke the given callback when the editor is destroyed.
+  # Essential: Invoke the given callback when the editor is destroyed.
   #
   # * `callback` {Function} to be called when the editor is destroyed.
   #
@@ -320,7 +354,7 @@ class TextEditor extends Model
   # Immediately calls your callback for each existing cursor.
   #
   # * `callback` {Function}
-  #   * `selection` {Selection} that was added
+  #   * `cursor` {Cursor} that was added
   #
   # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
   observeCursors: (callback) ->
@@ -415,80 +449,40 @@ class TextEditor extends Model
     @displayBuffer.onDidChangeCharacterWidths(callback)
 
   onDidChangeScrollTop: (callback) ->
-    @emitter.on 'did-change-scroll-top', callback
+    Grim.deprecate("This is now a view method. Call TextEditorElement::onDidChangeScrollTop instead.")
+
+    @viewRegistry.getView(this).onDidChangeScrollTop(callback)
 
   onDidChangeScrollLeft: (callback) ->
-    @emitter.on 'did-change-scroll-left', callback
+    Grim.deprecate("This is now a view method. Call TextEditorElement::onDidChangeScrollLeft instead.")
 
-  on: (eventName) ->
-    switch eventName
-      when 'title-changed'
-        deprecate("Use TextEditor::onDidChangeTitle instead")
-      when 'path-changed'
-        deprecate("Use TextEditor::onDidChangePath instead")
-      when 'modified-status-changed'
-        deprecate("Use TextEditor::onDidChangeModified instead")
-      when 'soft-wrap-changed'
-        deprecate("Use TextEditor::onDidChangeSoftWrapped instead")
-      when 'grammar-changed'
-        deprecate("Use TextEditor::onDidChangeGrammar instead")
-      when 'character-widths-changed'
-        deprecate("Use TextEditor::onDidChangeCharacterWidths instead")
-      when 'contents-modified'
-        deprecate("Use TextEditor::onDidStopChanging instead")
-      when 'contents-conflicted'
-        deprecate("Use TextEditor::onDidConflict instead")
+    @viewRegistry.getView(this).onDidChangeScrollLeft(callback)
 
-      when 'will-insert-text'
-        deprecate("Use TextEditor::onWillInsertText instead")
-      when 'did-insert-text'
-        deprecate("Use TextEditor::onDidInsertText instead")
+  onDidRequestAutoscroll: (callback) ->
+    @displayBuffer.onDidRequestAutoscroll(callback)
 
-      when 'cursor-added'
-        deprecate("Use TextEditor::onDidAddCursor instead")
-      when 'cursor-removed'
-        deprecate("Use TextEditor::onDidRemoveCursor instead")
-      when 'cursor-moved'
-        deprecate("Use TextEditor::onDidChangeCursorPosition instead")
+  # TODO Remove once the tabs package no longer uses .on subscriptions
+  onDidChangeIcon: (callback) ->
+    @emitter.on 'did-change-icon', callback
 
-      when 'selection-added'
-        deprecate("Use TextEditor::onDidAddSelection instead")
-      when 'selection-removed'
-        deprecate("Use TextEditor::onDidRemoveSelection instead")
-      when 'selection-screen-range-changed'
-        deprecate("Use TextEditor::onDidChangeSelectionRange instead")
+  onDidUpdateMarkers: (callback) ->
+    @displayBuffer.onDidUpdateMarkers(callback)
 
-      when 'decoration-added'
-        deprecate("Use TextEditor::onDidAddDecoration instead")
-      when 'decoration-removed'
-        deprecate("Use TextEditor::onDidRemoveDecoration instead")
-      when 'decoration-updated'
-        deprecate("Use Decoration::onDidChangeProperties instead. You will get the decoration back from `TextEditor::decorateMarker()`")
-      when 'decoration-changed'
-        deprecate("Use Marker::onDidChange instead. eg. `editor::decorateMarker(...).getMarker().onDidChange()`")
-
-      when 'screen-lines-changed'
-        deprecate("Use TextEditor::onDidChange instead")
-
-      when 'scroll-top-changed'
-        deprecate("Use TextEditor::onDidChangeScrollTop instead")
-      when 'scroll-left-changed'
-        deprecate("Use TextEditor::onDidChangeScrollLeft instead")
-
-    EmitterMixin::on.apply(this, arguments)
-
-  # Retrieves the current {TextBuffer}.
+  # Essential: Retrieves the current {TextBuffer}.
   getBuffer: -> @buffer
 
   # Retrieves the current buffer's URI.
-  getUri: -> @buffer.getUri()
+  getURI: -> @buffer.getUri()
 
   # Create an {TextEditor} with its initial state based on this object
   copy: ->
-    tabLength = @getTabLength()
     displayBuffer = @displayBuffer.copy()
     softTabs = @getSoftTabs()
-    newEditor = new TextEditor({@buffer, displayBuffer, tabLength, softTabs, suppressCursorCreation: true, registerEditor: true})
+    newEditor = new TextEditor({
+      @buffer, displayBuffer, @tabLength, softTabs, suppressCursorCreation: true,
+      @config, @notificationManager, @packageManager, @clipboard, @viewRegistry,
+      @grammarRegistry, @project, @assert, @applicationDelegate
+    })
     for marker in @findMarkers(editorId: @id)
       marker.copy(editorId: newEditor.id, preserveFolds: true)
     newEditor
@@ -499,17 +493,68 @@ class TextEditor extends Model
   setMini: (mini) ->
     if mini isnt @mini
       @mini = mini
-      @updateInvisibles()
+      @displayBuffer.setIgnoreInvisibles(@mini)
+      @emitter.emit 'did-change-mini', @mini
+    @mini
 
   isMini: -> @mini
+
+  onDidChangeMini: (callback) ->
+    @emitter.on 'did-change-mini', callback
+
+  setLineNumberGutterVisible: (lineNumberGutterVisible) ->
+    unless lineNumberGutterVisible is @lineNumberGutter.isVisible()
+      if lineNumberGutterVisible
+        @lineNumberGutter.show()
+      else
+        @lineNumberGutter.hide()
+      @emitter.emit 'did-change-line-number-gutter-visible', @lineNumberGutter.isVisible()
+    @lineNumberGutter.isVisible()
+
+  isLineNumberGutterVisible: -> @lineNumberGutter.isVisible()
+
+  onDidChangeLineNumberGutterVisible: (callback) ->
+    @emitter.on 'did-change-line-number-gutter-visible', callback
+
+  # Essential: Calls your `callback` when a {Gutter} is added to the editor.
+  # Immediately calls your callback for each existing gutter.
+  #
+  # * `callback` {Function}
+  #   * `gutter` {Gutter} that currently exists/was added.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  observeGutters: (callback) ->
+    @gutterContainer.observeGutters callback
+
+  # Essential: Calls your `callback` when a {Gutter} is added to the editor.
+  #
+  # * `callback` {Function}
+  #   * `gutter` {Gutter} that was added.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  onDidAddGutter: (callback) ->
+    @gutterContainer.onDidAddGutter callback
+
+  # Essential: Calls your `callback` when a {Gutter} is removed from the editor.
+  #
+  # * `callback` {Function}
+  #   * `name` The name of the {Gutter} that was removed.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  onDidRemoveGutter: (callback) ->
+    @gutterContainer.onDidRemoveGutter callback
 
   # Set the number of characters that can be displayed horizontally in the
   # editor.
   #
-  # * `editorWidthInChars` A {Number} representing the width of the {TextEditorView}
-  # in characters.
+  # * `editorWidthInChars` A {Number} representing the width of the
+  # {TextEditorElement} in characters.
   setEditorWidthInChars: (editorWidthInChars) ->
     @displayBuffer.setEditorWidthInChars(editorWidthInChars)
+
+  # Returns the editor width in characters.
+  getEditorWidthInChars: ->
+    @displayBuffer.getEditorWidthInChars()
 
   ###
   Section: File Details
@@ -538,7 +583,7 @@ class TextEditor extends Model
   getLongTitle: ->
     if sessionPath = @getPath()
       fileName = path.basename(sessionPath)
-      directory = atom.project.relativize(path.dirname(sessionPath))
+      directory = @project.relativize(path.dirname(sessionPath))
       directory = if directory.length > 0 then directory else path.basename(path.dirname(sessionPath))
       "#{fileName} - #{directory}"
     else
@@ -546,6 +591,16 @@ class TextEditor extends Model
 
   # Essential: Returns the {String} path of this editor's text buffer.
   getPath: -> @buffer.getPath()
+
+  # Extended: Returns the {String} character set encoding of this editor's text
+  # buffer.
+  getEncoding: -> @buffer.getEncoding()
+
+  # Extended: Set the character set encoding to use in this editor's text
+  # buffer.
+  #
+  # * `encoding` The {String} character set encoding name such as 'utf8'
+  setEncoding: (encoding) -> @buffer.setEncoding(encoding)
 
   # Essential: Returns {Boolean} `true` if this editor has been modified.
   isModified: -> @buffer.isModified()
@@ -556,7 +611,7 @@ class TextEditor extends Model
   # Copies the current file path to the native clipboard.
   copyPathToClipboard: ->
     if filePath = @getPath()
-      atom.clipboard.write(filePath)
+      @clipboard.write(filePath)
 
   ###
   Section: File Operations
@@ -565,18 +620,45 @@ class TextEditor extends Model
   # Essential: Saves the editor's text buffer.
   #
   # See {TextBuffer::save} for more details.
-  save: -> @buffer.save()
+  save: -> @buffer.save(backup: @config.get('editor.backUpBeforeSaving'))
 
-  # Public: Saves the editor's text buffer as the given path.
+  # Essential: Saves the editor's text buffer as the given path.
   #
   # See {TextBuffer::saveAs} for more details.
   #
   # * `filePath` A {String} path.
-  saveAs: (filePath) -> @buffer.saveAs(filePath)
+  saveAs: (filePath) -> @buffer.saveAs(filePath, backup: @config.get('editor.backUpBeforeSaving'))
 
   # Determine whether the user should be prompted to save before closing
   # this editor.
-  shouldPromptToSave: -> @isModified() and not @buffer.hasMultipleEditors()
+  shouldPromptToSave: ({windowCloseRequested}={}) ->
+    if windowCloseRequested
+      @isModified()
+    else
+      @isModified() and not @buffer.hasMultipleEditors()
+
+  # Returns an {Object} to configure dialog shown when this editor is saved
+  # via {Pane::saveItemAs}.
+  getSaveDialogOptions: -> {}
+
+  checkoutHeadRevision: ->
+    if filePath = this.getPath()
+      checkoutHead = =>
+        @project.repositoryForDirectory(new Directory(path.dirname(filePath)))
+          .then (repository) =>
+            repository?.checkoutHeadForEditor(this)
+
+      if @config.get('editor.confirmCheckoutHeadRevision')
+        @applicationDelegate.confirm
+          message: 'Confirm Checkout HEAD Revision'
+          detailedMessage: "Are you sure you want to discard all changes to \"#{path.basename(filePath)}\" since the last Git commit?"
+          buttons:
+            OK: checkoutHead
+            Cancel: null
+      else
+        checkoutHead()
+    else
+      Promise.resolve(false)
 
   ###
   Section: Reading Text
@@ -613,9 +695,6 @@ class TextEditor extends Model
   #
   # * `bufferRow` A {Number} representing a zero-indexed buffer row.
   lineTextForBufferRow: (bufferRow) -> @buffer.lineForRow(bufferRow)
-  lineForBufferRow: (bufferRow) ->
-    deprecate 'Use TextEditor::lineTextForBufferRow(bufferRow) instead'
-    @lineTextForBufferRow(bufferRow)
 
   # Essential: Returns a {String} representing the contents of the line at the
   # given screen row.
@@ -629,31 +708,21 @@ class TextEditor extends Model
   #
   # Returns {TokenizedLine}
   tokenizedLineForScreenRow: (screenRow) -> @displayBuffer.tokenizedLineForScreenRow(screenRow)
-  lineForScreenRow: (screenRow) ->
-    deprecate "TextEditor::tokenizedLineForScreenRow(bufferRow) is the new name. But it's private. Try to use TextEditor::lineTextForScreenRow instead"
-    @tokenizedLineForScreenRow(screenRow)
 
   # {Delegates to: DisplayBuffer.tokenizedLinesForScreenRows}
   tokenizedLinesForScreenRows: (start, end) -> @displayBuffer.tokenizedLinesForScreenRows(start, end)
-  linesForScreenRows: (start, end) ->
-    deprecate "Use TextEditor::tokenizedLinesForScreenRows instead"
-    @tokenizedLinesForScreenRows(start, end)
-
-  # Returns a {Number} representing the line length for the given
-  # buffer row, exclusive of its line-ending character(s).
-  #
-  # * `row` A {Number} indicating the buffer row.
-  lineLengthForBufferRow: (row) ->
-    deprecate "Use editor.lineTextForBufferRow(row).length instead"
-    @lineTextForBufferRow(row).length
 
   bufferRowForScreenRow: (row) -> @displayBuffer.bufferRowForScreenRow(row)
 
   # {Delegates to: DisplayBuffer.bufferRowsForScreenRows}
   bufferRowsForScreenRows: (startRow, endRow) -> @displayBuffer.bufferRowsForScreenRows(startRow, endRow)
 
+  screenRowForBufferRow: (row) -> @displayBuffer.screenRowForBufferRow(row)
+
   # {Delegates to: DisplayBuffer.getMaxLineLength}
   getMaxScreenLineLength: -> @displayBuffer.getMaxLineLength()
+
+  getLongestScreenRow: -> @displayBuffer.getLongestScreenRow()
 
   # Returns the range for the given buffer row.
   #
@@ -677,7 +746,7 @@ class TextEditor extends Model
   # {Delegates to: TextBuffer.getEndPosition}
   getEofBufferPosition: -> @buffer.getEndPosition()
 
-  # Public: Get the {Range} of the paragraph surrounding the most recently added
+  # Essential: Get the {Range} of the paragraph surrounding the most recently added
   # cursor.
   #
   # Returns a {Range}.
@@ -690,15 +759,20 @@ class TextEditor extends Model
   ###
 
   # Essential: Replaces the entire contents of the buffer with the given {String}.
+  #
+  # * `text` A {String} to replace with
   setText: (text) -> @buffer.setText(text)
 
   # Essential: Set the text in the given {Range} in buffer coordinates.
   #
   # * `range` A {Range} or range-compatible {Array}.
   # * `text` A {String}
+  # * `options` (optional) {Object}
+  #   * `normalizeLineEndings` (optional) {Boolean} (default: true)
+  #   * `undo` (optional) {String} 'skip' will skip the undo system
   #
   # Returns the {Range} of the newly-inserted text.
-  setTextInBufferRange: (range, text, normalizeLineEndings) -> @getBuffer().setTextInRange(range, text, normalizeLineEndings)
+  setTextInBufferRange: (range, text, options) -> @getBuffer().setTextInRange(range, text, options)
 
   # Essential: For each selection, replace the selected text with the given text.
   #
@@ -706,32 +780,32 @@ class TextEditor extends Model
   # * `options` (optional) See {Selection::insertText}.
   #
   # Returns a {Range} when the text has been inserted
-  # Returns a {Bool} false when the text has not been inserted
+  # Returns a {Boolean} false when the text has not been inserted
   insertText: (text, options={}) ->
-    willInsert = true
-    cancel = -> willInsert = false
-    willInsertEvent = {cancel, text}
-    @emit('will-insert-text', willInsertEvent)
-    @emitter.emit 'will-insert-text', willInsertEvent
+    return false unless @emitWillInsertTextEvent(text)
 
-    if willInsert
-      options.autoIndentNewline ?= @shouldAutoIndent()
-      options.autoDecreaseIndent ?= @shouldAutoIndent()
-      @mutateSelectedText (selection) =>
+    groupingInterval = if options.groupUndo
+      @config.get('editor.undoGroupingInterval')
+    else
+      0
+
+    options.autoIndentNewline ?= @shouldAutoIndent()
+    options.autoDecreaseIndent ?= @shouldAutoIndent()
+    @mutateSelectedText(
+      (selection) =>
         range = selection.insertText(text, options)
         didInsertEvent = {text, range}
-        @emit('did-insert-text', didInsertEvent)
         @emitter.emit 'did-insert-text', didInsertEvent
         range
-    else
-      false
+      , groupingInterval
+    )
 
   # Essential: For each selection, replace the selected text with a newline.
   insertNewline: ->
     @insertText('\n')
 
   # Essential: For each selection, if the selection is empty, delete the character
-  # preceding the cursor. Otherwise delete the selected text.
+  # following the cursor. Otherwise delete the selected text.
   delete: ->
     @mutateSelectedText (selection) -> selection.delete()
 
@@ -748,8 +822,10 @@ class TextEditor extends Model
   # * `fn` A {Function} that will be called once for each {Selection}. The first
   #      argument will be a {Selection} and the second argument will be the
   #      {Number} index of that selection.
-  mutateSelectedText: (fn) ->
-    @transact => fn(selection, index) for selection, index in @getSelections()
+  mutateSelectedText: (fn, groupingInterval=0) ->
+    @mergeIntersectingSelections =>
+      @transact groupingInterval, =>
+        fn(selection, index) for selection, index in @getSelectionsOrderedByBufferPosition()
 
   # Move lines intersection the most recent selection up by one row in screen
   # coordinates.
@@ -885,11 +961,7 @@ class TextEditor extends Model
         selection.setBufferRange(selectedBufferRange.translate([delta, 0]))
         for [foldStartRow, foldEndRow] in foldedRowRanges
           @createFold(foldStartRow + delta, foldEndRow + delta)
-
-  # Deprecated: Use {::duplicateLines} instead.
-  duplicateLine: ->
-    deprecate("Use TextEditor::duplicateLines() instead")
-    @duplicateLines()
+      return
 
   replaceSelectedText: (options={}, fn) ->
     {selectWordIfEmpty} = options
@@ -908,17 +980,19 @@ class TextEditor extends Model
   # selections to create multiple single-line selections that cumulatively cover
   # the same original area.
   splitSelectionsIntoLines: ->
-    for selection in @getSelections()
-      range = selection.getBufferRange()
-      continue if range.isSingleLine()
+    @mergeIntersectingSelections =>
+      for selection in @getSelections()
+        range = selection.getBufferRange()
+        continue if range.isSingleLine()
 
-      selection.destroy()
-      {start, end} = range
-      @addSelectionForBufferRange([start, [start.row, Infinity]])
-      {row} = start
-      while ++row < end.row
-        @addSelectionForBufferRange([[row, 0], [row, Infinity]])
-      @addSelectionForBufferRange([[end.row, 0], [end.row, end.column]]) unless end.column is 0
+        {start, end} = range
+        @addSelectionForBufferRange([start, [start.row, Infinity]])
+        {row} = start
+        while ++row < end.row
+          @addSelectionForBufferRange([[row, 0], [row, Infinity]])
+        @addSelectionForBufferRange([[end.row, 0], [end.row, end.column]]) unless end.column is 0
+        selection.destroy()
+      return
 
   # Extended: For each selection, transpose the selected text.
   #
@@ -940,20 +1014,18 @@ class TextEditor extends Model
   # For each selection, if the selection is empty, converts the containing word
   # to upper case. Otherwise convert the selected text to upper case.
   upperCase: ->
-    @replaceSelectedText selectWordIfEmpty:true, (text) -> text.toUpperCase()
+    @replaceSelectedText selectWordIfEmpty: true, (text) -> text.toUpperCase()
 
   # Extended: Convert the selected text to lower case.
   #
   # For each selection, if the selection is empty, converts the containing word
   # to upper case. Otherwise convert the selected text to upper case.
   lowerCase: ->
-    @replaceSelectedText selectWordIfEmpty:true, (text) -> text.toLowerCase()
+    @replaceSelectedText selectWordIfEmpty: true, (text) -> text.toLowerCase()
 
   # Extended: Toggle line comments for rows intersecting selections.
   #
   # If the current grammar doesn't support comments, does nothing.
-  #
-  # Returns an {Array} of the commented {Range}s.
   toggleLineCommentsInSelection: ->
     @mutateSelectedText (selection) -> selection.toggleLineComments()
 
@@ -998,6 +1070,28 @@ class TextEditor extends Model
   deleteToBeginningOfWord: ->
     @mutateSelectedText (selection) -> selection.deleteToBeginningOfWord()
 
+  # Extended: Similar to {::deleteToBeginningOfWord}, but deletes only back to the
+  # previous word boundary.
+  deleteToPreviousWordBoundary: ->
+    @mutateSelectedText (selection) -> selection.deleteToPreviousWordBoundary()
+
+  # Extended: Similar to {::deleteToEndOfWord}, but deletes only up to the
+  # next word boundary.
+  deleteToNextWordBoundary: ->
+    @mutateSelectedText (selection) -> selection.deleteToNextWordBoundary()
+
+  # Extended: For each selection, if the selection is empty, delete all characters
+  # of the containing subword following the cursor. Otherwise delete the selected
+  # text.
+  deleteToBeginningOfSubword: ->
+    @mutateSelectedText (selection) -> selection.deleteToBeginningOfSubword()
+
+  # Extended: For each selection, if the selection is empty, delete all characters
+  # of the containing subword following the cursor. Otherwise delete the selected
+  # text.
+  deleteToEndOfSubword: ->
+    @mutateSelectedText (selection) -> selection.deleteToEndOfSubword()
+
   # Extended: For each selection, if the selection is empty, delete all characters
   # of the containing line that precede the cursor. Otherwise delete the
   # selected text.
@@ -1019,17 +1113,8 @@ class TextEditor extends Model
 
   # Extended: Delete all lines intersecting selections.
   deleteLine: ->
+    @mergeSelectionsOnSameRows()
     @mutateSelectedText (selection) -> selection.deleteLine()
-
-  # Deprecated: Use {::deleteToBeginningOfWord} instead.
-  backspaceToBeginningOfWord: ->
-    deprecate("Use TextEditor::deleteToBeginningOfWord() instead")
-    @deleteToBeginningOfWord()
-
-  # Deprecated: Use {::deleteToBeginningOfLine} instead.
-  backspaceToBeginningOfLine: ->
-    deprecate("Use TextEditor::deleteToBeginningOfLine() instead")
-    @deleteToBeginningOfLine()
 
   ###
   Section: History
@@ -1037,13 +1122,13 @@ class TextEditor extends Model
 
   # Essential: Undo the last change.
   undo: ->
-    @getLastCursor().needsAutoscroll = true
-    @buffer.undo(this)
+    @avoidMergingSelections => @buffer.undo()
+    @getLastSelection().autoscroll()
 
   # Essential: Redo the last change.
   redo: ->
-    @getLastCursor().needsAutoscroll = true
-    @buffer.redo(this)
+    @avoidMergingSelections => @buffer.redo()
+    @getLastSelection().autoscroll()
 
   # Extended: Batch multiple operations as a single undo/redo step.
   #
@@ -1052,26 +1137,53 @@ class TextEditor extends Model
   # abort the transaction, call {::abortTransaction} to terminate the function's
   # execution and revert any changes performed up to the abortion.
   #
+  # * `groupingInterval` (optional) The {Number} of milliseconds for which this
+  #   transaction should be considered 'groupable' after it begins. If a transaction
+  #   with a positive `groupingInterval` is committed while the previous transaction is
+  #   still 'groupable', the two transactions are merged with respect to undo and redo.
   # * `fn` A {Function} to call inside the transaction.
-  transact: (fn) -> @buffer.transact(fn)
+  transact: (groupingInterval, fn) ->
+    @buffer.transact(groupingInterval, fn)
 
-  # Extended: Start an open-ended transaction.
-  #
-  # Call {::commitTransaction} or {::abortTransaction} to terminate the
-  # transaction. If you nest calls to transactions, only the outermost
-  # transaction is considered. You must match every begin with a matching
-  # commit, but a single call to abort will cancel all nested transactions.
-  beginTransaction: -> @buffer.beginTransaction()
+  # Deprecated: Start an open-ended transaction.
+  beginTransaction: (groupingInterval) ->
+    Grim.deprecate('Transactions should be performed via TextEditor::transact only')
+    @buffer.beginTransaction(groupingInterval)
 
-  # Extended: Commit an open-ended transaction started with {::beginTransaction}
-  # and push it to the undo stack.
-  #
-  # If transactions are nested, only the outermost commit takes effect.
-  commitTransaction: -> @buffer.commitTransaction()
+  # Deprecated: Commit an open-ended transaction started with {::beginTransaction}.
+  commitTransaction: ->
+    Grim.deprecate('Transactions should be performed via TextEditor::transact only')
+    @buffer.commitTransaction()
 
   # Extended: Abort an open transaction, undoing any operations performed so far
   # within the transaction.
   abortTransaction: -> @buffer.abortTransaction()
+
+  # Extended: Create a pointer to the current state of the buffer for use
+  # with {::revertToCheckpoint} and {::groupChangesSinceCheckpoint}.
+  #
+  # Returns a checkpoint value.
+  createCheckpoint: -> @buffer.createCheckpoint()
+
+  # Extended: Revert the buffer to the state it was in when the given
+  # checkpoint was created.
+  #
+  # The redo stack will be empty following this operation, so changes since the
+  # checkpoint will be lost. If the given checkpoint is no longer present in the
+  # undo history, no changes will be made to the buffer and this method will
+  # return `false`.
+  #
+  # Returns a {Boolean} indicating whether the operation succeeded.
+  revertToCheckpoint: (checkpoint) -> @buffer.revertToCheckpoint(checkpoint)
+
+  # Extended: Group all changes since the given checkpoint into a single
+  # transaction for purposes of undo/redo.
+  #
+  # If the given checkpoint is no longer present in the undo history, no
+  # grouping will be performed and this method will return `false`.
+  #
+  # Returns a {Boolean} indicating whether the operation succeeded.
+  groupChangesSinceCheckpoint: (checkpoint) -> @buffer.groupChangesSinceCheckpoint(checkpoint)
 
   ###
   Section: TextEditor Coordinates
@@ -1167,6 +1279,14 @@ class TextEditor extends Model
   # Returns a {Point}.
   clipScreenPosition: (screenPosition, options) -> @displayBuffer.clipScreenPosition(screenPosition, options)
 
+  # Extended: Clip the start and end of the given range to valid positions on screen.
+  # See {::clipScreenPosition} for more information.
+  #
+  # * `range` The {Range} to clip.
+  # * `options` (optional) See {::clipScreenPosition} `options`.
+  # Returns a {Range}.
+  clipScreenRange: (range, options) -> @displayBuffer.clipScreenRange(range, options)
+
   ###
   Section: Decorations
   ###
@@ -1175,11 +1295,11 @@ class TextEditor extends Model
   # is invalidated, or is destroyed, the decoration will be updated to reflect
   # the marker's state.
   #
-  # There are three types of supported decorations:
+  # The following are the supported decorations types:
   #
   # * __line__: Adds your CSS `class` to the line nodes within the range
   #     marked by the marker
-  # * __gutter__: Adds your CSS `class` to the line number nodes within the
+  # * __line-number__: Adds your CSS `class` to the line number nodes within the
   #     range marked by the marker
   # * __highlight__: Adds a new highlight div to the editor surrounding the
   #     range marked by the marker. When the user selects text, the selection is
@@ -1191,42 +1311,115 @@ class TextEditor extends Model
   #       <div class="region"></div>
   #     </div>
   #     ```
+  # * __overlay__: Positions the view associated with the given item at the head
+  #     or tail of the given `Marker`.
+  # * __gutter__: A decoration that tracks a {Marker} in a {Gutter}. Gutter
+  #     decorations are created by calling {Gutter::decorateMarker} on the
+  #     desired `Gutter` instance.
   #
   # ## Arguments
   #
   # * `marker` A {Marker} you want this decoration to follow.
-  # * `decorationParams` An {Object} representing the decoration eg. `{type: 'gutter', class: 'linter-error'}`
-  #   * `type` There are a few supported decoration types: `gutter`, `line`, and `highlight`
+  # * `decorationParams` An {Object} representing the decoration e.g.
+  #   `{type: 'line-number', class: 'linter-error'}`
+  #   * `type` There are several supported decoration types. The behavior of the
+  #     types are as follows:
+  #     * `line` Adds the given `class` to the lines overlapping the rows
+  #        spanned by the `Marker`.
+  #     * `line-number` Adds the given `class` to the line numbers overlapping
+  #       the rows spanned by the `Marker`.
+  #     * `highlight` Creates a `.highlight` div with the nested class with up
+  #       to 3 nested regions that fill the area spanned by the `Marker`.
+  #     * `overlay` Positions the view associated with the given item at the
+  #       head or tail of the given `Marker`, depending on the `position`
+  #       property.
+  #     * `gutter` Tracks a {Marker} in a {Gutter}. Created by calling
+  #       {Gutter::decorateMarker} on the desired `Gutter` instance.
   #   * `class` This CSS class will be applied to the decorated line number,
-  #     line, or highlight.
-  #   * `onlyHead` (optional) If `true`, the decoration will only be applied to the head
-  #     of the marker. Only applicable to the `line` and `gutter` types.
-  #   * `onlyEmpty` (optional) If `true`, the decoration will only be applied if the
-  #     associated marker is empty. Only applicable to the `line` and
-  #     `gutter` types.
-  #   * `onlyNonEmpty` (optional) If `true`, the decoration will only be applied if the
-  #     associated marker is non-empty.  Only applicable to the `line` and
-  #     gutter types.
+  #     line, highlight, or overlay.
+  #   * `item` (optional) An {HTMLElement} or a model {Object} with a
+  #     corresponding view registered. Only applicable to the `gutter` and
+  #     `overlay` types.
+  #   * `onlyHead` (optional) If `true`, the decoration will only be applied to
+  #     the head of the `Marker`. Only applicable to the `line` and
+  #     `line-number` types.
+  #   * `onlyEmpty` (optional) If `true`, the decoration will only be applied if
+  #     the associated `Marker` is empty. Only applicable to the `gutter`,
+  #     `line`, and `line-number` types.
+  #   * `onlyNonEmpty` (optional) If `true`, the decoration will only be applied
+  #     if the associated `Marker` is non-empty. Only applicable to the
+  #     `gutter`, `line`, and `line-number` types.
+  #   * `position` (optional) Only applicable to decorations of type `overlay`,
+  #     controls where the overlay view is positioned relative to the `Marker`.
+  #     Values can be `'head'` (the default), or `'tail'`.
   #
   # Returns a {Decoration} object
   decorateMarker: (marker, decorationParams) ->
     @displayBuffer.decorateMarker(marker, decorationParams)
 
-  # Public: Get all the decorations within a screen row range.
+  # Essential: Get all the decorations within a screen row range.
   #
   # * `startScreenRow` the {Number} beginning screen row
   # * `endScreenRow` the {Number} end screen row (inclusive)
   #
   # Returns an {Object} of decorations in the form
-  #  `{1: [{id: 10, type: 'gutter', class: 'someclass'}], 2: ...}`
+  #  `{1: [{id: 10, type: 'line-number', class: 'someclass'}], 2: ...}`
   #   where the keys are {Marker} IDs, and the values are an array of decoration
   #   params objects attached to the marker.
   # Returns an empty object when no decorations are found
   decorationsForScreenRowRange: (startScreenRow, endScreenRow) ->
     @displayBuffer.decorationsForScreenRowRange(startScreenRow, endScreenRow)
 
+  # Extended: Get all decorations.
+  #
+  # * `propertyFilter` (optional) An {Object} containing key value pairs that
+  #   the returned decorations' properties must match.
+  #
+  # Returns an {Array} of {Decoration}s.
+  getDecorations: (propertyFilter) ->
+    @displayBuffer.getDecorations(propertyFilter)
+
+  # Extended: Get all decorations of type 'line'.
+  #
+  # * `propertyFilter` (optional) An {Object} containing key value pairs that
+  #   the returned decorations' properties must match.
+  #
+  # Returns an {Array} of {Decoration}s.
+  getLineDecorations: (propertyFilter) ->
+    @displayBuffer.getLineDecorations(propertyFilter)
+
+  # Extended: Get all decorations of type 'line-number'.
+  #
+  # * `propertyFilter` (optional) An {Object} containing key value pairs that
+  #   the returned decorations' properties must match.
+  #
+  # Returns an {Array} of {Decoration}s.
+  getLineNumberDecorations: (propertyFilter) ->
+    @displayBuffer.getLineNumberDecorations(propertyFilter)
+
+  # Extended: Get all decorations of type 'highlight'.
+  #
+  # * `propertyFilter` (optional) An {Object} containing key value pairs that
+  #   the returned decorations' properties must match.
+  #
+  # Returns an {Array} of {Decoration}s.
+  getHighlightDecorations: (propertyFilter) ->
+    @displayBuffer.getHighlightDecorations(propertyFilter)
+
+  # Extended: Get all decorations of type 'overlay'.
+  #
+  # * `propertyFilter` (optional) An {Object} containing key value pairs that
+  #   the returned decorations' properties must match.
+  #
+  # Returns an {Array} of {Decoration}s.
+  getOverlayDecorations: (propertyFilter) ->
+    @displayBuffer.getOverlayDecorations(propertyFilter)
+
   decorationForId: (id) ->
     @displayBuffer.decorationForId(id)
+
+  decorationsForMarkerId: (id) ->
+    @displayBuffer.decorationsForMarkerId(id)
 
   ###
   Section: Markers
@@ -1240,11 +1433,17 @@ class TextEditor extends Model
   # * `range` A {Range} or range-compatible {Array}
   # * `properties` A hash of key-value pairs to associate with the marker. There
   #   are also reserved property names that have marker-specific meaning.
-  #   * `reversed` (optional) Creates the marker in a reversed orientation. (default: false)
-  #   * `persistent` (optional) Whether to include this marker when serializing the buffer. (default: true)
-  #   * `invalidate` (optional) Determines the rules by which changes to the
-  #     buffer *invalidate* the marker. (default: 'overlap') It can be any of
-  #     the following strategies, in order of fragility
+  #   * `maintainHistory` (optional) {Boolean} Whether to store this marker's
+  #     range before and after each change in the undo history. This allows the
+  #     marker's position to be restored more accurately for certain undo/redo
+  #     operations, but uses more time and memory. (default: false)
+  #   * `reversed` (optional) {Boolean} Creates the marker in a reversed
+  #     orientation. (default: false)
+  #   * `persistent` (optional) {Boolean} Whether to include this marker when
+  #     serializing the buffer. (default: true)
+  #   * `invalidate` (optional) {String} Determines the rules by which changes
+  #     to the buffer *invalidate* the marker. (default: 'overlap') It can be
+  #     any of the following strategies, in order of fragility:
   #     * __never__: The marker is never marked as invalid. This is a good choice for
   #       markers representing selections in an editor.
   #     * __surround__: The marker is invalidated by changes that completely surround it.
@@ -1269,11 +1468,17 @@ class TextEditor extends Model
   # * `range` A {Range} or range-compatible {Array}
   # * `properties` A hash of key-value pairs to associate with the marker. There
   #   are also reserved property names that have marker-specific meaning.
-  #   * `reversed` (optional) Creates the marker in a reversed orientation. (default: false)
-  #   * `persistent` (optional) Whether to include this marker when serializing the buffer. (default: true)
-  #   * `invalidate` (optional) Determines the rules by which changes to the
-  #     buffer *invalidate* the marker. (default: 'overlap') It can be any of
-  #     the following strategies, in order of fragility
+  #   * `maintainHistory` (optional) {Boolean} Whether to store this marker's
+  #     range before and after each change in the undo history. This allows the
+  #     marker's position to be restored more accurately for certain undo/redo
+  #     operations, but uses more time and memory. (default: false)
+  #   * `reversed` (optional) {Boolean} Creates the marker in a reversed
+  #     orientation. (default: false)
+  #   * `persistent` (optional) {Boolean} Whether to include this marker when
+  #     serializing the buffer. (default: true)
+  #   * `invalidate` (optional) {String} Determines the rules by which changes
+  #     to the buffer *invalidate* the marker. (default: 'overlap') It can be
+  #     any of the following strategies, in order of fragility:
   #     * __never__: The marker is never marked as invalid. This is a good choice for
   #       markers representing selections in an editor.
   #     * __surround__: The marker is invalidated by changes that completely surround it.
@@ -1330,6 +1535,25 @@ class TextEditor extends Model
   findMarkers: (properties) ->
     @displayBuffer.findMarkers(properties)
 
+  # Extended: Observe changes in the set of markers that intersect a particular
+  # region of the editor.
+  #
+  # * `callback` A {Function} to call whenever one or more {Marker}s appears,
+  #    disappears, or moves within the given region.
+  #   * `event` An {Object} with the following keys:
+  #     * `insert` A {Set} containing the ids of all markers that appeared
+  #        in the range.
+  #     * `update` A {Set} containing the ids of all markers that moved within
+  #        the region.
+  #     * `remove` A {Set} containing the ids of all markers that disappeared
+  #        from the region.
+  #
+  # Returns a {MarkerObservationWindow}, which allows you to specify the region
+  # of interest by calling {MarkerObservationWindow::setBufferRange} or
+  # {MarkerObservationWindow::setScreenRange}.
+  observeMarkers: (callback) ->
+    @displayBuffer.observeMarkers(callback)
+
   # Extended: Get the {Marker} for the given marker id.
   #
   # * `id` {Number} id of the marker
@@ -1378,6 +1602,16 @@ class TextEditor extends Model
   setCursorBufferPosition: (position, options) ->
     @moveCursors (cursor) -> cursor.setBufferPosition(position, options)
 
+  # Essential: Get a {Cursor} at given screen coordinates {Point}
+  #
+  # * `position` A {Point} or {Array} of `[row, column]`
+  #
+  # Returns the first matched {Cursor} or undefined
+  getCursorAtScreenPosition: (position) ->
+    for cursor in @cursors
+      return cursor if cursor.getScreenPosition().isEqual(position)
+    undefined
+
   # Essential: Get the position of the most recently added cursor in screen
   # coordinates.
   #
@@ -1390,13 +1624,6 @@ class TextEditor extends Model
   # Returns {Array} of {Point}s in the order the cursors were added
   getCursorScreenPositions: ->
     cursor.getScreenPosition() for cursor in @getCursors()
-
-  # Get the row of the most recently added cursor in screen coordinates.
-  #
-  # Returns the screen row {Number}.
-  getCursorScreenRow: ->
-    deprecate('Use `editor.getCursorScreenPosition().row` instead')
-    @getCursorScreenPosition().row
 
   # Essential: Move the cursor to the given position in screen coordinates.
   #
@@ -1414,8 +1641,9 @@ class TextEditor extends Model
   # * `bufferPosition` A {Point} or {Array} of `[row, column]`
   #
   # Returns a {Cursor}.
-  addCursorAtBufferPosition: (bufferPosition) ->
+  addCursorAtBufferPosition: (bufferPosition, options) ->
     @markBufferPosition(bufferPosition, @getSelectionMarkerAttributes())
+    @getLastSelection().cursor.autoscroll() unless options?.autoscroll is false
     @getLastSelection().cursor
 
   # Essential: Add a cursor at the position in screen coordinates.
@@ -1423,8 +1651,9 @@ class TextEditor extends Model
   # * `screenPosition` A {Point} or {Array} of `[row, column]`
   #
   # Returns a {Cursor}.
-  addCursorAtScreenPosition: (screenPosition) ->
+  addCursorAtScreenPosition: (screenPosition, options) ->
     @markScreenPosition(screenPosition, @getSelectionMarkerAttributes())
+    @getLastSelection().cursor.autoscroll() unless options?.autoscroll is false
     @getLastSelection().cursor
 
   # Essential: Returns {Boolean} indicating whether or not there are multiple cursors.
@@ -1436,85 +1665,52 @@ class TextEditor extends Model
   # * `lineCount` (optional) {Number} number of lines to move
   moveUp: (lineCount) ->
     @moveCursors (cursor) -> cursor.moveUp(lineCount, moveToEndOfSelection: true)
-  moveCursorUp: (lineCount) ->
-    deprecate("Use TextEditor::moveUp() instead")
-    @moveUp(lineCount)
 
   # Essential: Move every cursor down one row in screen coordinates.
   #
   # * `lineCount` (optional) {Number} number of lines to move
   moveDown: (lineCount) ->
     @moveCursors (cursor) -> cursor.moveDown(lineCount, moveToEndOfSelection: true)
-  moveCursorDown: (lineCount) ->
-    deprecate("Use TextEditor::moveDown() instead")
-    @moveDown(lineCount)
 
   # Essential: Move every cursor left one column.
   #
   # * `columnCount` (optional) {Number} number of columns to move (default: 1)
   moveLeft: (columnCount) ->
     @moveCursors (cursor) -> cursor.moveLeft(columnCount, moveToEndOfSelection: true)
-  moveCursorLeft: ->
-    deprecate("Use TextEditor::moveLeft() instead")
-    @moveLeft()
 
   # Essential: Move every cursor right one column.
   #
   # * `columnCount` (optional) {Number} number of columns to move (default: 1)
   moveRight: (columnCount) ->
     @moveCursors (cursor) -> cursor.moveRight(columnCount, moveToEndOfSelection: true)
-  moveCursorRight: ->
-    deprecate("Use TextEditor::moveRight() instead")
-    @moveRight()
 
   # Essential: Move every cursor to the beginning of its line in buffer coordinates.
   moveToBeginningOfLine: ->
     @moveCursors (cursor) -> cursor.moveToBeginningOfLine()
-  moveCursorToBeginningOfLine: ->
-    deprecate("Use TextEditor::moveToBeginningOfLine() instead")
-    @moveToBeginningOfLine()
 
   # Essential: Move every cursor to the beginning of its line in screen coordinates.
   moveToBeginningOfScreenLine: ->
     @moveCursors (cursor) -> cursor.moveToBeginningOfScreenLine()
-  moveCursorToBeginningOfScreenLine: ->
-    deprecate("Use TextEditor::moveToBeginningOfScreenLine() instead")
-    @moveToBeginningOfScreenLine()
 
   # Essential: Move every cursor to the first non-whitespace character of its line.
   moveToFirstCharacterOfLine: ->
     @moveCursors (cursor) -> cursor.moveToFirstCharacterOfLine()
-  moveCursorToFirstCharacterOfLine: ->
-    deprecate("Use TextEditor::moveToFirstCharacterOfLine() instead")
-    @moveToFirstCharacterOfLine()
 
   # Essential: Move every cursor to the end of its line in buffer coordinates.
   moveToEndOfLine: ->
     @moveCursors (cursor) -> cursor.moveToEndOfLine()
-  moveCursorToEndOfLine: ->
-    deprecate("Use TextEditor::moveToEndOfLine() instead")
-    @moveToEndOfLine()
 
   # Essential: Move every cursor to the end of its line in screen coordinates.
   moveToEndOfScreenLine: ->
     @moveCursors (cursor) -> cursor.moveToEndOfScreenLine()
-  moveCursorToEndOfScreenLine: ->
-    deprecate("Use TextEditor::moveToEndOfScreenLine() instead")
-    @moveToEndOfScreenLine()
 
   # Essential: Move every cursor to the beginning of its surrounding word.
   moveToBeginningOfWord: ->
     @moveCursors (cursor) -> cursor.moveToBeginningOfWord()
-  moveCursorToBeginningOfWord: ->
-    deprecate("Use TextEditor::moveToBeginningOfWord() instead")
-    @moveToBeginningOfWord()
 
   # Essential: Move every cursor to the end of its surrounding word.
   moveToEndOfWord: ->
     @moveCursors (cursor) -> cursor.moveToEndOfWord()
-  moveCursorToEndOfWord: ->
-    deprecate("Use TextEditor::moveToEndOfWord() instead")
-    @moveToEndOfWord()
 
   # Cursor Extended
 
@@ -1523,62 +1719,45 @@ class TextEditor extends Model
   # If there are multiple cursors, they will be merged into a single cursor.
   moveToTop: ->
     @moveCursors (cursor) -> cursor.moveToTop()
-  moveCursorToTop: ->
-    deprecate("Use TextEditor::moveToTop() instead")
-    @moveToTop()
 
   # Extended: Move every cursor to the bottom of the buffer.
   #
   # If there are multiple cursors, they will be merged into a single cursor.
   moveToBottom: ->
     @moveCursors (cursor) -> cursor.moveToBottom()
-  moveCursorToBottom: ->
-    deprecate("Use TextEditor::moveToBottom() instead")
-    @moveToBottom()
 
   # Extended: Move every cursor to the beginning of the next word.
   moveToBeginningOfNextWord: ->
     @moveCursors (cursor) -> cursor.moveToBeginningOfNextWord()
-  moveCursorToBeginningOfNextWord: ->
-    deprecate("Use TextEditor::moveToBeginningOfNextWord() instead")
-    @moveToBeginningOfNextWord()
 
   # Extended: Move every cursor to the previous word boundary.
   moveToPreviousWordBoundary: ->
     @moveCursors (cursor) -> cursor.moveToPreviousWordBoundary()
-  moveCursorToPreviousWordBoundary: ->
-    deprecate("Use TextEditor::moveToPreviousWordBoundary() instead")
-    @moveToPreviousWordBoundary()
 
   # Extended: Move every cursor to the next word boundary.
   moveToNextWordBoundary: ->
     @moveCursors (cursor) -> cursor.moveToNextWordBoundary()
-  moveCursorToNextWordBoundary: ->
-    deprecate("Use TextEditor::moveToNextWordBoundary() instead")
-    @moveToNextWordBoundary()
+
+  # Extended: Move every cursor to the previous subword boundary.
+  moveToPreviousSubwordBoundary: ->
+    @moveCursors (cursor) -> cursor.moveToPreviousSubwordBoundary()
+
+  # Extended: Move every cursor to the next subword boundary.
+  moveToNextSubwordBoundary: ->
+    @moveCursors (cursor) -> cursor.moveToNextSubwordBoundary()
 
   # Extended: Move every cursor to the beginning of the next paragraph.
   moveToBeginningOfNextParagraph: ->
     @moveCursors (cursor) -> cursor.moveToBeginningOfNextParagraph()
-  moveCursorToBeginningOfNextParagraph: ->
-    deprecate("Use TextEditor::moveToBeginningOfNextParagraph() instead")
-    @moveToBeginningOfNextParagraph()
 
   # Extended: Move every cursor to the beginning of the previous paragraph.
   moveToBeginningOfPreviousParagraph: ->
     @moveCursors (cursor) -> cursor.moveToBeginningOfPreviousParagraph()
-  moveCursorToBeginningOfPreviousParagraph: ->
-    deprecate("Use TextEditor::moveToBeginningOfPreviousParagraph() instead")
-    @moveToBeginningOfPreviousParagraph()
 
   # Extended: Returns the most recently added {Cursor}
   getLastCursor: ->
+    @createLastSelectionIfNeeded()
     _.last(@cursors)
-
-  # Deprecated:
-  getCursor: ->
-    deprecate("Use TextEditor::getLastCursor() instead")
-    @getLastCursor()
 
   # Extended: Returns the word surrounding the most recently added cursor.
   #
@@ -1588,7 +1767,8 @@ class TextEditor extends Model
 
   # Extended: Get an Array of all {Cursor}s.
   getCursors: ->
-    cursor for cursor in @cursors
+    @createLastSelectionIfNeeded()
+    @cursors.slice()
 
   # Extended: Get all {Cursors}s, ordered by their position in the buffer
   # instead of the order in which they were added.
@@ -1599,44 +1779,37 @@ class TextEditor extends Model
 
   # Add a cursor based on the given {Marker}.
   addCursor: (marker) ->
-    cursor = new Cursor(editor: this, marker: marker)
+    cursor = new Cursor(editor: this, marker: marker, config: @config)
     @cursors.push(cursor)
-    @decorateMarker(marker, type: 'gutter', class: 'cursor-line')
-    @decorateMarker(marker, type: 'gutter', class: 'cursor-line-no-selection', onlyHead: true, onlyEmpty: true)
+    @decorateMarker(marker, type: 'line-number', class: 'cursor-line')
+    @decorateMarker(marker, type: 'line-number', class: 'cursor-line-no-selection', onlyHead: true, onlyEmpty: true)
     @decorateMarker(marker, type: 'line', class: 'cursor-line', onlyEmpty: true)
-    @emit 'cursor-added', cursor
     @emitter.emit 'did-add-cursor', cursor
     cursor
-
-  # Remove the given cursor from this editor.
-  removeCursor: (cursor) ->
-    _.remove(@cursors, cursor)
-    @emit 'cursor-removed', cursor
-    @emitter.emit 'did-remove-cursor', cursor
 
   moveCursors: (fn) ->
     fn(cursor) for cursor in @getCursors()
     @mergeCursors()
 
   cursorMoved: (event) ->
-    @emit 'cursor-moved', event
     @emitter.emit 'did-change-cursor-position', event
 
   # Merge cursors that have the same screen position
   mergeCursors: ->
-    positions = []
+    positions = {}
     for cursor in @getCursors()
       position = cursor.getBufferPosition().toString()
-      if position in positions
+      if positions.hasOwnProperty(position)
         cursor.destroy()
       else
-        positions.push(position)
+        positions[position] = true
+    return
 
   preserveCursorPositionOnBufferReload: ->
     cursorPosition = null
-    @subscribe @buffer.onWillReload =>
+    @disposables.add @buffer.onWillReload =>
       cursorPosition = @getCursorBufferPosition()
-    @subscribe @buffer.onDidReload =>
+    @disposables.add @buffer.onDidReload =>
       @setCursorBufferPosition(cursorPosition) if cursorPosition
       cursorPosition = null
 
@@ -1672,6 +1845,8 @@ class TextEditor extends Model
   # * `options` (optional) An options {Object}:
   #   * `reversed` A {Boolean} indicating whether to create the selection in a
   #     reversed orientation.
+  #   * `preserveFolds` A {Boolean}, which if `true` preserves the fold settings after the
+  #     selection is set.
   setSelectedBufferRange: (bufferRange, options) ->
     @setSelectedBufferRanges([bufferRange], options)
 
@@ -1682,6 +1857,8 @@ class TextEditor extends Model
   # * `options` (optional) An options {Object}:
   #   * `reversed` A {Boolean} indicating whether to create the selection in a
   #     reversed orientation.
+  #   * `preserveFolds` A {Boolean}, which if `true` preserves the fold settings after the
+  #     selection is set.
   setSelectedBufferRanges: (bufferRanges, options={}) ->
     throw new Error("Passed an empty array to setSelectedBufferRanges") unless bufferRanges.length
 
@@ -1695,6 +1872,7 @@ class TextEditor extends Model
           selections[i].setBufferRange(bufferRange, options)
         else
           @addSelectionForBufferRange(bufferRange, options)
+      return
 
   # Essential: Get the {Range} of the most recently added selection in screen
   # coordinates.
@@ -1741,6 +1919,7 @@ class TextEditor extends Model
           selections[i].setScreenRange(screenRange, options)
         else
           @addSelectionForScreenRange(screenRange, options)
+      return
 
   # Essential: Add a selection for the given range in buffer coordinates.
   #
@@ -1752,9 +1931,8 @@ class TextEditor extends Model
   # Returns the added {Selection}.
   addSelectionForBufferRange: (bufferRange, options={}) ->
     @markBufferRange(bufferRange, _.defaults(@getSelectionMarkerAttributes(), options))
-    selection = @getLastSelection()
-    selection.autoscroll() if @manageScrollPosition
-    selection
+    @getLastSelection().autoscroll() unless options.autoscroll is false
+    @getLastSelection()
 
   # Essential: Add a selection for the given range in screen coordinates.
   #
@@ -1766,9 +1944,8 @@ class TextEditor extends Model
   # Returns the added {Selection}.
   addSelectionForScreenRange: (screenRange, options={}) ->
     @markScreenRange(screenRange, _.defaults(@getSelectionMarkerAttributes(), options))
-    selection = @getLastSelection()
-    selection.autoscroll() if @manageScrollPosition
-    selection
+    @getLastSelection().autoscroll() unless options.autoscroll is false
+    @getLastSelection()
 
   # Essential: Select from the current cursor position to the given position in
   # buffer coordinates.
@@ -1787,10 +1964,11 @@ class TextEditor extends Model
   # This method may merge selections that end up intesecting.
   #
   # * `position` An instance of {Point}, with a given `row` and `column`.
-  selectToScreenPosition: (position) ->
+  selectToScreenPosition: (position, options) ->
     lastSelection = @getLastSelection()
-    lastSelection.selectToScreenPosition(position)
-    @mergeIntersectingSelections(reversed: lastSelection.isReversed())
+    lastSelection.selectToScreenPosition(position, options)
+    unless options?.suppressSelectionMerge
+      @mergeIntersectingSelections(reversed: lastSelection.isReversed())
 
   # Essential: Move the cursor of each selection one character upward while
   # preserving the selection's tail position.
@@ -1885,21 +2063,29 @@ class TextEditor extends Model
   selectToEndOfWord: ->
     @expandSelectionsForward (selection) -> selection.selectToEndOfWord()
 
+  # Extended: For each selection, move its cursor to the preceding subword
+  # boundary while maintaining the selection's tail position.
+  #
+  # This method may merge selections that end up intersecting.
+  selectToPreviousSubwordBoundary: ->
+    @expandSelectionsBackward (selection) -> selection.selectToPreviousSubwordBoundary()
+
+  # Extended: For each selection, move its cursor to the next subword boundary
+  # while maintaining the selection's tail position.
+  #
+  # This method may merge selections that end up intersecting.
+  selectToNextSubwordBoundary: ->
+    @expandSelectionsForward (selection) -> selection.selectToNextSubwordBoundary()
+
   # Essential: For each cursor, select the containing line.
   #
   # This method merges selections on successive lines.
   selectLinesContainingCursors: ->
     @expandSelectionsForward (selection) -> selection.selectLine()
-  selectLine: ->
-    deprecate('Use TextEditor::selectLinesContainingCursors instead')
-    @selectLinesContainingCursors()
 
   # Essential: Select the word surrounding each cursor.
   selectWordsContainingCursors: ->
     @expandSelectionsForward (selection) -> selection.selectWord()
-  selectWord: ->
-    deprecate('Use TextEditor::selectWordsContainingCursors instead')
-    @selectWordsContainingCursors()
 
   # Selection Extended
 
@@ -1953,22 +2139,15 @@ class TextEditor extends Model
   #
   # Returns a {Selection}.
   getLastSelection: ->
+    @createLastSelectionIfNeeded()
     _.last(@selections)
-
-  # Deprecated:
-  getSelection: (index) ->
-    if index?
-      deprecate("Use TextEditor::getSelections()[index] instead when getting a specific selection")
-      @getSelections()[index]
-    else
-      deprecate("Use TextEditor::getLastSelection() instead")
-      @getLastSelection()
 
   # Extended: Get current {Selection}s.
   #
   # Returns: An {Array} of {Selection}s.
   getSelections: ->
-    selection for selection in @selections
+    @createLastSelectionIfNeeded()
+    @selections.slice()
 
   # Extended: Get all {Selection}s, ordered by their position in the buffer
   # instead of the order in which they were added.
@@ -2015,15 +2194,18 @@ class TextEditor extends Model
   expandSelectionsForward: (fn) ->
     @mergeIntersectingSelections =>
       fn(selection) for selection in @getSelections()
+      return
 
   # Calls the given function with each selection, then merges selections in the
   # reversed orientation
   expandSelectionsBackward: (fn) ->
     @mergeIntersectingSelections reversed: true, =>
       fn(selection) for selection in @getSelections()
+      return
 
   finalizeSelections: ->
     selection.finalize() for selection in @getSelections()
+    return
 
   selectionsForScreenRows: (startRow, endRow) ->
     @getSelections().filter (selection) -> selection.intersectsScreenRowRange(startRow, endRow)
@@ -2032,6 +2214,22 @@ class TextEditor extends Model
   # the function with merging suppressed, then merges intersecting selections
   # afterward.
   mergeIntersectingSelections: (args...) ->
+    @mergeSelections args..., (previousSelection, currentSelection) ->
+      exclusive = not currentSelection.isEmpty() and not previousSelection.isEmpty()
+
+      previousSelection.intersectsWith(currentSelection, exclusive)
+
+  mergeSelectionsOnSameRows: (args...) ->
+    @mergeSelections args..., (previousSelection, currentSelection) ->
+      screenRange = currentSelection.getScreenRange()
+
+      previousSelection.intersectsScreenRowRange(screenRange.start.row, screenRange.end.row)
+
+  avoidMergingSelections: (args...) ->
+    @mergeSelections args..., -> false
+
+  mergeSelections: (args...) ->
+    mergePredicate = args.pop()
     fn = args.pop() if _.isFunction(_.last(args))
     options = args.pop() ? {}
 
@@ -2043,18 +2241,16 @@ class TextEditor extends Model
       @suppressSelectionMerging = false
 
     reducer = (disjointSelections, selection) ->
-      intersectingSelection = _.find disjointSelections, (otherSelection) ->
-        exclusive = not selection.isEmpty() and not otherSelection.isEmpty()
-        intersects = otherSelection.intersectsWith(selection, exclusive)
-        intersects
-
-      if intersectingSelection?
-        intersectingSelection.merge(selection, options)
+      adjacentSelection = _.last(disjointSelections)
+      if mergePredicate(adjacentSelection, selection)
+        adjacentSelection.merge(selection, options)
         disjointSelections
       else
         disjointSelections.concat([selection])
 
-    _.reduce(@getSelections(), reducer, [])
+    [head, tail...] = @getSelectionsOrderedByBufferPosition()
+    _.reduce(tail, reducer, [head])
+    return result if fn?
 
   # Add a {Selection} based on the given {Marker}.
   #
@@ -2064,46 +2260,50 @@ class TextEditor extends Model
   # Returns the new {Selection}.
   addSelection: (marker, options={}) ->
     unless marker.getProperties().preserveFolds
-      @destroyFoldsIntersectingBufferRange(marker.getBufferRange())
+      @destroyFoldsContainingBufferRange(marker.getBufferRange())
     cursor = @addCursor(marker)
-    selection = new Selection(_.extend({editor: this, marker, cursor}, options))
+    selection = new Selection(_.extend({editor: this, marker, cursor, @clipboard}, options))
     @selections.push(selection)
     selectionBufferRange = selection.getBufferRange()
     @mergeIntersectingSelections(preserveFolds: marker.getProperties().preserveFolds)
+
     if selection.destroyed
       for selection in @getSelections()
         if selection.intersectsBufferRange(selectionBufferRange)
           return selection
     else
-      @emit 'selection-added', selection
       @emitter.emit 'did-add-selection', selection
       selection
 
   # Remove the given selection.
   removeSelection: (selection) ->
+    _.remove(@cursors, selection.cursor)
     _.remove(@selections, selection)
-    @emit 'selection-removed', selection
+    @emitter.emit 'did-remove-cursor', selection.cursor
     @emitter.emit 'did-remove-selection', selection
 
   # Reduce one or more selections to a single empty selection based on the most
   # recently added cursor.
-  clearSelections: ->
+  clearSelections: (options) ->
     @consolidateSelections()
-    @getLastSelection().clear()
+    @getLastSelection().clear(options)
 
-  # Reduce multiple selections to the most recently added selection.
+  # Reduce multiple selections to the least recently added selection.
   consolidateSelections: ->
     selections = @getSelections()
     if selections.length > 1
-      selection.destroy() for selection in selections[0...-1]
+      selection.destroy() for selection in selections[1...(selections.length)]
       true
     else
       false
 
   # Called by the selection
   selectionRangeChanged: (event) ->
-    @emit 'selection-screen-range-changed', event
     @emitter.emit 'did-change-selection-range', event
+
+  createLastSelectionIfNeeded: ->
+    if @selections.length is 0
+      @addSelectionForBufferRange([[0, 0], [0, 0]], autoscroll: false, preserveFolds: true)
 
   ###
   Section: Searching and Replacing
@@ -2127,7 +2327,7 @@ class TextEditor extends Model
   #     * `replace` Call this {Function} with a {String} to replace the match.
   scan: (regex, iterator) -> @buffer.scan(regex, iterator)
 
-  # Public: Scan regular expression matches in a given range, calling the given
+  # Essential: Scan regular expression matches in a given range, calling the given
   # iterator function on each match.
   #
   # * `regex` A {RegExp} to search for.
@@ -2141,7 +2341,7 @@ class TextEditor extends Model
   #   * `replace` Call this {Function} with a {String} to replace the match.
   scanInBufferRange: (regex, range, iterator) -> @buffer.scanInRange(regex, range, iterator)
 
-  # Public: Scan regular expression matches in a given range in reverse order,
+  # Essential: Scan regular expression matches in a given range in reverse order,
   # calling the given iterator function on each match.
   #
   # * `regex` A {RegExp} to search for.
@@ -2176,9 +2376,11 @@ class TextEditor extends Model
   # Returns a {Number}.
   getTabLength: -> @displayBuffer.getTabLength()
 
-  # Essential: Set the on-screen length of tab characters.
+  # Essential: Set the on-screen length of tab characters. Setting this to a
+  # {Number} This will override the `editor.tabLength` setting.
   #
-  # * `tabLength` {Number} length of a single tab
+  # * `tabLength` {Number} length of a single tab. Setting to `null` will
+  #   fallback to using the `editor.tabLength` config setting
   setTabLength: (tabLength) -> @displayBuffer.setTabLength(tabLength)
 
   # Extended: Determine if the buffer uses hard or soft tabs.
@@ -2212,6 +2414,20 @@ class TextEditor extends Model
     return unless @getSoftTabs()
     @scanInBufferRange /\t/g, bufferRange, ({replace}) => replace(@getTabText())
 
+  # Private: Computes whether or not this editor should use softTabs based on
+  # the `editor.tabType` setting.
+  #
+  # Returns a {Boolean}
+  shouldUseSoftTabs: ({defaultValue}) ->
+    tabType = @config.get('editor.tabType', scope: @getRootScopeDescriptor())
+    switch tabType
+      when 'auto'
+        @usesSoftTabs() ? defaultValue ? @config.get('editor.softTabs') ? true
+      when 'hard'
+        false
+      when 'soft'
+        true
+
   ###
   Section: Soft Wrap Behavior
   ###
@@ -2220,9 +2436,6 @@ class TextEditor extends Model
   #
   # Returns a {Boolean}.
   isSoftWrapped: (softWrapped) -> @displayBuffer.isSoftWrapped()
-  getSoftWrapped: ->
-    deprecate("Use TextEditor::isSoftWrapped instead")
-    @displayBuffer.isSoftWrapped()
 
   # Essential: Enable or disable soft wrapping for this editor.
   #
@@ -2230,19 +2443,13 @@ class TextEditor extends Model
   #
   # Returns a {Boolean}.
   setSoftWrapped: (softWrapped) -> @displayBuffer.setSoftWrapped(softWrapped)
-  setSoftWrap: (softWrapped) ->
-    deprecate("Use TextEditor::setSoftWrapped instead")
-    @setSoftWrapped(softWrapped)
 
   # Essential: Toggle soft wrapping for this editor
   #
   # Returns a {Boolean}.
   toggleSoftWrapped: -> @setSoftWrapped(not @isSoftWrapped())
-  toggleSoftWrap: ->
-    deprecate("Use TextEditor::toggleSoftWrapped instead")
-    @toggleSoftWrapped()
 
-  # Public: Gets the column at which column will soft wrap
+  # Essential: Gets the column at which column will soft wrap
   getSoftWrapColumn: -> @displayBuffer.getSoftWrapColumn()
 
   ###
@@ -2314,13 +2521,14 @@ class TextEditor extends Model
     options.autoIndent ?= @shouldAutoIndent()
     @mutateSelectedText (selection) -> selection.indent(options)
 
-  # Constructs the string used for tabs.
-  buildIndentString: (number, column=0) ->
+  # Constructs the string used for indents.
+  buildIndentString: (level, column=0) ->
     if @getSoftTabs()
       tabStopViolation = column % @getTabLength()
-      _.multiplyString(" ", Math.floor(number * @getTabLength()) - tabStopViolation)
+      _.multiplyString(" ", Math.floor(level * @getTabLength()) - tabStopViolation)
     else
-      _.multiplyString("\t", Math.floor(number))
+      excessWhitespace = _.multiplyString(' ', Math.round((level - Math.floor(level)) * @getTabLength()))
+      _.multiplyString("\t", Math.floor(level)) + excessWhitespace
 
   ###
   Section: Grammars
@@ -2347,17 +2555,14 @@ class TextEditor extends Model
   Section: Managing Syntax Scopes
   ###
 
-  # Public: Get the syntactic scopes for the most recently added cursor's
-  # position. See {::scopesForBufferPosition} for more information.
-  #
-  # Returns an {Array} of {String}s.
-  scopesAtCursor: -> @getLastCursor().getScopes()
-  getCursorScopes: ->
-    deprecate 'Use TextEditor::scopesAtCursor() instead'
-    @scopesAtCursor()
+  # Essential: Returns a {ScopeDescriptor} that includes this editor's language.
+  # e.g. `['.source.ruby']`, or `['.source.coffee']`. You can use this with
+  # {Config::get} to get language specific config values.
+  getRootScopeDescriptor: ->
+    @displayBuffer.getRootScopeDescriptor()
 
-  # Essential: Get the syntactic scopes for the given position in buffer
-  # coordinates.
+  # Essential: Get the syntactic scopeDescriptor for the given position in buffer
+  # coordinates. Useful with {Config::get}.
   #
   # For example, if called with a position inside the parameter list of an
   # anonymous CoffeeScript function, the method returns the following array:
@@ -2365,8 +2570,9 @@ class TextEditor extends Model
   #
   # * `bufferPosition` A {Point} or {Array} of [row, column].
   #
-  # Returns an {Array} of {String}s.
-  scopesForBufferPosition: (bufferPosition) -> @displayBuffer.scopesForBufferPosition(bufferPosition)
+  # Returns a {ScopeDescriptor}.
+  scopeDescriptorForBufferPosition: (bufferPosition) ->
+    @displayBuffer.scopeDescriptorForBufferPosition(bufferPosition)
 
   # Extended: Get the range in buffer coordinates of all tokens surrounding the
   # cursor that match the given scope selector.
@@ -2374,22 +2580,28 @@ class TextEditor extends Model
   # For example, if you wanted to find the string surrounding the cursor, you
   # could call `editor.bufferRangeForScopeAtCursor(".string.quoted")`.
   #
+  # * `scopeSelector` {String} selector. e.g. `'.source.ruby'`
+  #
   # Returns a {Range}.
-  bufferRangeForScopeAtCursor: (selector) ->
-    @displayBuffer.bufferRangeForScopeAtPosition(selector, @getCursorBufferPosition())
-
-  logCursorScope: ->
-    console.log @scopesAtCursor()
-
-  # {Delegates to: DisplayBuffer.tokenForBufferPosition}
-  tokenForBufferPosition: (bufferPosition) -> @displayBuffer.tokenForBufferPosition(bufferPosition)
+  bufferRangeForScopeAtCursor: (scopeSelector) ->
+    @displayBuffer.bufferRangeForScopeAtPosition(scopeSelector, @getCursorBufferPosition())
 
   # Extended: Determine if the given row is entirely a comment
   isBufferRowCommented: (bufferRow) ->
     if match = @lineTextForBufferRow(bufferRow).match(/\S/)
-      scopes = @tokenForBufferPosition([bufferRow, match.index]).scopes
       @commentScopeSelector ?= new TextMateScopeSelector('comment.*')
-      @commentScopeSelector.matches(scopes)
+      @commentScopeSelector.matches(@scopeDescriptorForBufferPosition([bufferRow, match.index]).scopes)
+
+  logCursorScope: ->
+    scopeDescriptor = @getLastCursor().getScopeDescriptor()
+    list = scopeDescriptor.scopes.toString().split(',')
+    list = list.map (item) -> "* #{item}"
+    content = "Scopes at Cursor\n#{list.join('\n')}"
+
+    @notificationManager.addInfo(content, dismissable: true)
+
+  # {Delegates to: DisplayBuffer.tokenForBufferPosition}
+  tokenForBufferPosition: (bufferPosition) -> @displayBuffer.tokenForBufferPosition(bufferPosition)
 
   ###
   Section: Clipboard Operations
@@ -2398,15 +2610,35 @@ class TextEditor extends Model
   # Essential: For each selection, copy the selected text.
   copySelectedText: ->
     maintainClipboard = false
-    for selection in @getSelections()
-      selection.copy(maintainClipboard)
+    for selection in @getSelectionsOrderedByBufferPosition()
+      if selection.isEmpty()
+        previousRange = selection.getBufferRange()
+        selection.selectLine()
+        selection.copy(maintainClipboard, true)
+        selection.setBufferRange(previousRange)
+      else
+        selection.copy(maintainClipboard, false)
       maintainClipboard = true
+    return
+
+  # Private: For each selection, only copy highlighted text.
+  copyOnlySelectedText: ->
+    maintainClipboard = false
+    for selection in @getSelectionsOrderedByBufferPosition()
+      if not selection.isEmpty()
+        selection.copy(maintainClipboard, true)
+        maintainClipboard = true
+    return
 
   # Essential: For each selection, cut the selected text.
   cutSelectedText: ->
     maintainClipboard = false
     @mutateSelectedText (selection) ->
-      selection.cut(maintainClipboard)
+      if selection.isEmpty()
+        selection.selectLine()
+        selection.cut(maintainClipboard, true)
+      else
+        selection.cut(maintainClipboard, false)
       maintainClipboard = true
 
   # Essential: For each selection, replace the selected text with the contents of
@@ -2418,30 +2650,55 @@ class TextEditor extends Model
   #
   # * `options` (optional) See {Selection::insertText}.
   pasteText: (options={}) ->
-    {text, metadata} = atom.clipboard.readWithMetadata()
+    {text: clipboardText, metadata} = @clipboard.readWithMetadata()
+    return false unless @emitWillInsertTextEvent(clipboardText)
 
-    containsNewlines = text.indexOf('\n') isnt -1
+    metadata ?= {}
+    options.autoIndent = @shouldAutoIndentOnPaste()
 
-    if metadata?.selections? and metadata.selections.length is @getSelections().length
-      @mutateSelectedText (selection, index) ->
-        text = metadata.selections[index]
-        selection.insertText(text, options)
+    @mutateSelectedText (selection, index) =>
+      if metadata.selections?.length is @getSelections().length
+        {text, indentBasis, fullLine} = metadata.selections[index]
+      else
+        {indentBasis, fullLine} = metadata
+        text = clipboardText
 
-      return
+      delete options.indentBasis
+      {cursor} = selection
+      if indentBasis?
+        containsNewlines = text.indexOf('\n') isnt -1
+        if containsNewlines or not cursor.hasPrecedingCharactersOnLine()
+          options.indentBasis ?= indentBasis
 
-    else if atom.config.get("editor.normalizeIndentOnPaste") and metadata?.indentBasis?
-      if !@getLastCursor().hasPrecedingCharactersOnLine() or containsNewlines
-        options.indentBasis ?= metadata.indentBasis
+      range = null
+      if fullLine and selection.isEmpty()
+        oldPosition = selection.getBufferRange().start
+        selection.setBufferRange([[oldPosition.row, 0], [oldPosition.row, 0]])
+        range = selection.insertText(text, options)
+        newPosition = oldPosition.translate([1, 0])
+        selection.setBufferRange([newPosition, newPosition])
+      else
+        range = selection.insertText(text, options)
 
-    @insertText(text, options)
+      didInsertEvent = {text, range}
+      @emitter.emit 'did-insert-text', didInsertEvent
 
-  # Public: For each selection, if the selection is empty, cut all characters
-  # of the containing line following the cursor. Otherwise cut the selected
+  # Essential: For each selection, if the selection is empty, cut all characters
+  # of the containing screen line following the cursor. Otherwise cut the selected
   # text.
   cutToEndOfLine: ->
     maintainClipboard = false
     @mutateSelectedText (selection) ->
       selection.cutToEndOfLine(maintainClipboard)
+      maintainClipboard = true
+
+  # Essential: For each selection, if the selection is empty, cut all characters
+  # of the containing buffer line following the cursor. Otherwise cut the
+  # selected text.
+  cutToEndOfBufferLine: ->
+    maintainClipboard = false
+    @mutateSelectedText (selection) ->
+      selection.cutToEndOfBufferLine(maintainClipboard)
       maintainClipboard = true
 
   ###
@@ -2481,6 +2738,7 @@ class TextEditor extends Model
   # Extended: For each selection, fold the rows it intersects.
   foldSelectedLines: ->
     selection.fold() for selection in @getSelections()
+    return
 
   # Extended: Fold all foldable lines.
   foldAll: ->
@@ -2504,7 +2762,8 @@ class TextEditor extends Model
   #
   # Returns a {Boolean}.
   isFoldableAtBufferRow: (bufferRow) ->
-    @languageMode.isFoldableAtBufferRow(bufferRow)
+    # @languageMode.isFoldableAtBufferRow(bufferRow)
+    @displayBuffer.tokenizedBuffer.tokenizedLineForRow(bufferRow)?.foldable ? false
 
   # Extended: Determine whether the given row in screen coordinates is foldable.
   #
@@ -2555,10 +2814,19 @@ class TextEditor extends Model
   destroyFoldWithId: (id) ->
     @displayBuffer.destroyFoldWithId(id)
 
-  # Remove any {Fold}s found that intersect the given buffer row.
+  # Remove any {Fold}s found that intersect the given buffer range.
   destroyFoldsIntersectingBufferRange: (bufferRange) ->
-    for row in [bufferRange.start.row..bufferRange.end.row]
-      @unfoldBufferRow(row)
+    @destroyFoldsContainingBufferRange(bufferRange)
+
+    for row in [bufferRange.end.row..bufferRange.start.row]
+      fold.destroy() for fold in @displayBuffer.foldsStartingAtBufferRow(row)
+
+    return
+
+  # Remove any {Fold}s found that contain the given buffer range.
+  destroyFoldsContainingBufferRange: (bufferRange) ->
+    @unfoldBufferRow(bufferRange.start.row)
+    @unfoldBufferRow(bufferRange.end.row)
 
   # {Delegates to: DisplayBuffer.largestFoldContainingBufferRow}
   largestFoldContainingBufferRow: (bufferRow) ->
@@ -2571,6 +2839,36 @@ class TextEditor extends Model
   # {Delegates to: DisplayBuffer.outermostFoldsForBufferRowRange}
   outermostFoldsInBufferRowRange: (startRow, endRow) ->
     @displayBuffer.outermostFoldsInBufferRowRange(startRow, endRow)
+
+  ###
+  Section: Gutters
+  ###
+
+  # Essential: Add a custom {Gutter}.
+  #
+  # * `options` An {Object} with the following fields:
+  #   * `name` (required) A unique {String} to identify this gutter.
+  #   * `priority` (optional) A {Number} that determines stacking order between
+  #       gutters. Lower priority items are forced closer to the edges of the
+  #       window. (default: -100)
+  #   * `visible` (optional) {Boolean} specifying whether the gutter is visible
+  #       initially after being created. (default: true)
+  #
+  # Returns the newly-created {Gutter}.
+  addGutter: (options) ->
+    @gutterContainer.addGutter(options)
+
+  # Essential: Get this editor's gutters.
+  #
+  # Returns an {Array} of {Gutter}s.
+  getGutters: ->
+    @gutterContainer.getGutters()
+
+  # Essential: Get the gutter with the given name.
+  #
+  # Returns a {Gutter}, or `null` if no gutter exists for the given name.
+  gutterWithName: (name) ->
+    @gutterContainer.gutterWithName(name)
 
   ###
   Section: Scrolling the TextEditor
@@ -2602,35 +2900,33 @@ class TextEditor extends Model
   scrollToScreenPosition: (screenPosition, options) ->
     @displayBuffer.scrollToScreenPosition(screenPosition, options)
 
-  # Essential: Scrolls the editor to the top
   scrollToTop: ->
-    @setScrollTop(0)
+    Grim.deprecate("This is now a view method. Call TextEditorElement::scrollToTop instead.")
 
-  # Essential: Scrolls the editor to the bottom
+    @viewRegistry.getView(this).scrollToTop()
+
   scrollToBottom: ->
-    @setScrollBottom(Infinity)
+    Grim.deprecate("This is now a view method. Call TextEditorElement::scrollToTop instead.")
+
+    @viewRegistry.getView(this).scrollToBottom()
 
   scrollToScreenRange: (screenRange, options) -> @displayBuffer.scrollToScreenRange(screenRange, options)
 
-  horizontallyScrollable: -> @displayBuffer.horizontallyScrollable()
+  getHorizontalScrollbarHeight: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getHorizontalScrollbarHeight instead.")
 
-  verticallyScrollable: -> @displayBuffer.verticallyScrollable()
+    @viewRegistry.getView(this).getHorizontalScrollbarHeight()
 
-  getHorizontalScrollbarHeight: -> @displayBuffer.getHorizontalScrollbarHeight()
-  setHorizontalScrollbarHeight: (height) -> @displayBuffer.setHorizontalScrollbarHeight(height)
+  getVerticalScrollbarWidth: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getVerticalScrollbarWidth instead.")
 
-  getVerticalScrollbarWidth: -> @displayBuffer.getVerticalScrollbarWidth()
-  setVerticalScrollbarWidth: (width) -> @displayBuffer.setVerticalScrollbarWidth(width)
+    @viewRegistry.getView(this).getVerticalScrollbarWidth()
 
   pageUp: ->
-    newScrollTop = @getScrollTop() - @getHeight()
     @moveUp(@getRowsPerPage())
-    @setScrollTop(newScrollTop)
 
   pageDown: ->
-    newScrollTop = @getScrollTop() + @getHeight()
     @moveDown(@getRowsPerPage())
-    @setScrollTop(newScrollTop)
 
   selectPageUp: ->
     @selectUp(@getRowsPerPage())
@@ -2640,35 +2936,31 @@ class TextEditor extends Model
 
   # Returns the number of rows per page
   getRowsPerPage: ->
-    Math.max(1, Math.ceil(@getHeight() / @getLineHeightInPixels()))
+    Math.max(@rowsPerPage ? 1, 1)
+
+  setRowsPerPage: (@rowsPerPage) ->
 
   ###
   Section: Config
   ###
 
   shouldAutoIndent: ->
-    atom.config.get("editor.autoIndent")
+    @config.get("editor.autoIndent", scope: @getRootScopeDescriptor())
 
-  shouldShowInvisibles: ->
-    not @mini and atom.config.get('editor.showInvisibles')
-
-  updateInvisibles: ->
-    if @shouldShowInvisibles()
-      @displayBuffer.setInvisibles(atom.config.get('editor.invisibles'))
-    else
-      @displayBuffer.setInvisibles(null)
+  shouldAutoIndentOnPaste: ->
+    @config.get("editor.autoIndentOnPaste", scope: @getRootScopeDescriptor())
 
   ###
   Section: Event Handlers
   ###
 
   handleTokenization: ->
-    @softTabs = @usesSoftTabs() ? @softTabs
+    @softTabs = @shouldUseSoftTabs(defaultValue: @softTabs)
 
   handleGrammarChange: ->
     @unfoldAll()
-    @emit 'grammar-changed'
-    @emitter.emit 'did-change-grammar'
+    @subscribeToTabTypeConfig()
+    @emitter.emit 'did-change-grammar', @getGrammar()
 
   handleMarkerCreated: (marker) =>
     if marker.matchesProperties(@getSelectionMarkerAttributes())
@@ -2678,13 +2970,13 @@ class TextEditor extends Model
   Section: TextEditor Rendering
   ###
 
-  # Public: Retrieves the greyed out placeholder of a mini editor.
+  # Essential: Retrieves the greyed out placeholder of a mini editor.
   #
   # Returns a {String}.
   getPlaceholderText: ->
     @placeholderText
 
-  # Public: Set the greyed out placeholder of a mini editor. Placeholder text
+  # Essential: Set the greyed out placeholder of a mini editor. Placeholder text
   # will be displayed when the editor has no content.
   #
   # * `placeholderText` {String} text that is displayed when the editor has no content.
@@ -2693,38 +2985,24 @@ class TextEditor extends Model
     @placeholderText = placeholderText
     @emitter.emit 'did-change-placeholder-text', @placeholderText
 
-  # Extended: Retrieves the number of the row that is visible and currently at the
-  # top of the editor.
-  #
-  # Returns a {Number}.
   getFirstVisibleScreenRow: ->
-    @getVisibleRowRange()[0]
+    deprecate("This is now a view method. Call TextEditorElement::getFirstVisibleScreenRow instead.")
+    @viewRegistry.getView(this).getVisibleRowRange()[0]
 
-  # Extended: Retrieves the number of the row that is visible and currently at the
-  # bottom of the editor.
-  #
-  # Returns a {Number}.
   getLastVisibleScreenRow: ->
-    @getVisibleRowRange()[1]
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getLastVisibleScreenRow instead.")
+    @viewRegistry.getView(this).getVisibleRowRange()[1]
 
-  # Extended: Converts a buffer position to a pixel position.
-  #
-  # * `bufferPosition` An object that represents a buffer position. It can be either
-  #   an {Object} (`{row, column}`), {Array} (`[row, column]`), or {Point}
-  #
-  # Returns an {Object} with two values: `top` and `left`, representing the pixel positions.
-  pixelPositionForBufferPosition: (bufferPosition) -> @displayBuffer.pixelPositionForBufferPosition(bufferPosition)
+  pixelPositionForBufferPosition: (bufferPosition) ->
+    Grim.deprecate("This method is deprecated on the model layer. Use `TextEditorElement::pixelPositionForBufferPosition` instead")
+    @viewRegistry.getView(this).pixelPositionForBufferPosition(bufferPosition)
 
-  # Extended: Converts a screen position to a pixel position.
-  #
-  # * `screenPosition` An object that represents a screen position. It can be either
-  #   an {Object} (`{row, column}`), {Array} (`[row, column]`), or {Point}
-  #
-  # Returns an {Object} with two values: `top` and `left`, representing the pixel positions.
-  pixelPositionForScreenPosition: (screenPosition) -> @displayBuffer.pixelPositionForScreenPosition(screenPosition)
+  pixelPositionForScreenPosition: (screenPosition) ->
+    Grim.deprecate("This method is deprecated on the model layer. Use `TextEditorElement::pixelPositionForScreenPosition` instead")
+    @viewRegistry.getView(this).pixelPositionForScreenPosition(screenPosition)
 
   getSelectionMarkerAttributes: ->
-    type: 'selection', editorId: @id, invalidate: 'never'
+    {type: 'selection', editorId: @id, invalidate: 'never', maintainHistory: true}
 
   getVerticalScrollMargin: -> @displayBuffer.getVerticalScrollMargin()
   setVerticalScrollMargin: (verticalScrollMargin) -> @displayBuffer.setVerticalScrollMargin(verticalScrollMargin)
@@ -2735,55 +3013,125 @@ class TextEditor extends Model
   getLineHeightInPixels: -> @displayBuffer.getLineHeightInPixels()
   setLineHeightInPixels: (lineHeightInPixels) -> @displayBuffer.setLineHeightInPixels(lineHeightInPixels)
 
-  batchCharacterMeasurement: (fn) -> @displayBuffer.batchCharacterMeasurement(fn)
+  getKoreanCharWidth: -> @displayBuffer.getKoreanCharWidth()
 
-  getScopedCharWidth: (scopeNames, char) -> @displayBuffer.getScopedCharWidth(scopeNames, char)
-  setScopedCharWidth: (scopeNames, char, width) -> @displayBuffer.setScopedCharWidth(scopeNames, char, width)
+  getHalfWidthCharWidth: -> @displayBuffer.getHalfWidthCharWidth()
 
-  getScopedCharWidths: (scopeNames) -> @displayBuffer.getScopedCharWidths(scopeNames)
-
-  clearScopedCharWidths: -> @displayBuffer.clearScopedCharWidths()
+  getDoubleWidthCharWidth: -> @displayBuffer.getDoubleWidthCharWidth()
 
   getDefaultCharWidth: -> @displayBuffer.getDefaultCharWidth()
-  setDefaultCharWidth: (defaultCharWidth) -> @displayBuffer.setDefaultCharWidth(defaultCharWidth)
+  setDefaultCharWidth: (defaultCharWidth, doubleWidthCharWidth, halfWidthCharWidth, koreanCharWidth) ->
+    @displayBuffer.setDefaultCharWidth(defaultCharWidth, doubleWidthCharWidth, halfWidthCharWidth, koreanCharWidth)
 
-  setHeight: (height) -> @displayBuffer.setHeight(height)
-  getHeight: -> @displayBuffer.getHeight()
+  setHeight: (height, reentrant=false) ->
+    if reentrant
+      @displayBuffer.setHeight(height)
+    else
+      Grim.deprecate("This is now a view method. Call TextEditorElement::setHeight instead.")
+      @viewRegistry.getView(this).setHeight(height)
+
+  getHeight: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getHeight instead.")
+    @displayBuffer.getHeight()
 
   getClientHeight: -> @displayBuffer.getClientHeight()
 
-  setWidth: (width) -> @displayBuffer.setWidth(width)
-  getWidth: -> @displayBuffer.getWidth()
+  setWidth: (width, reentrant=false) ->
+    if reentrant
+      @displayBuffer.setWidth(width)
+    else
+      Grim.deprecate("This is now a view method. Call TextEditorElement::setWidth instead.")
+      @viewRegistry.getView(this).setWidth(width)
 
-  getScrollTop: -> @displayBuffer.getScrollTop()
-  setScrollTop: (scrollTop) -> @displayBuffer.setScrollTop(scrollTop)
+  getWidth: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getWidth instead.")
+    @displayBuffer.getWidth()
 
-  getScrollBottom: -> @displayBuffer.getScrollBottom()
-  setScrollBottom: (scrollBottom) -> @displayBuffer.setScrollBottom(scrollBottom)
+  getScrollRow: -> @scrollRow
+  setScrollRow: (@scrollRow) ->
 
-  getScrollLeft: -> @displayBuffer.getScrollLeft()
-  setScrollLeft: (scrollLeft) -> @displayBuffer.setScrollLeft(scrollLeft)
+  getScrollColumn: -> @scrollColumn
+  setScrollColumn: (@scrollColumn) ->
 
-  getScrollRight: -> @displayBuffer.getScrollRight()
-  setScrollRight: (scrollRight) -> @displayBuffer.setScrollRight(scrollRight)
+  getScrollTop: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getScrollTop instead.")
 
-  getScrollHeight: -> @displayBuffer.getScrollHeight()
-  getScrollWidth: -> @displayBuffer.getScrollWidth()
+    @viewRegistry.getView(this).getScrollTop()
 
-  getVisibleRowRange: -> @displayBuffer.getVisibleRowRange()
+  setScrollTop: (scrollTop) ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::setScrollTop instead.")
 
-  intersectsVisibleRowRange: (startRow, endRow) -> @displayBuffer.intersectsVisibleRowRange(startRow, endRow)
+    @viewRegistry.getView(this).setScrollTop(scrollTop)
 
-  selectionIntersectsVisibleRowRange: (selection) -> @displayBuffer.selectionIntersectsVisibleRowRange(selection)
+  getScrollBottom: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getScrollBottom instead.")
 
-  screenPositionForPixelPosition: (pixelPosition) -> @displayBuffer.screenPositionForPixelPosition(pixelPosition)
+    @viewRegistry.getView(this).getScrollBottom()
 
-  pixelRectForScreenRange: (screenRange) -> @displayBuffer.pixelRectForScreenRange(screenRange)
+  setScrollBottom: (scrollBottom) ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::setScrollBottom instead.")
 
-  # Deprecated: Call {::joinLines} instead.
-  joinLine: ->
-    deprecate("Use TextEditor::joinLines() instead")
-    @joinLines()
+    @viewRegistry.getView(this).setScrollBottom(scrollBottom)
+
+  getScrollLeft: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getScrollLeft instead.")
+
+    @viewRegistry.getView(this).getScrollLeft()
+
+  setScrollLeft: (scrollLeft) ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::setScrollLeft instead.")
+
+    @viewRegistry.getView(this).setScrollLeft(scrollLeft)
+
+  getScrollRight: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getScrollRight instead.")
+
+    @viewRegistry.getView(this).getScrollRight()
+
+  setScrollRight: (scrollRight) ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::setScrollRight instead.")
+
+    @viewRegistry.getView(this).setScrollRight(scrollRight)
+
+  getScrollHeight: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getScrollHeight instead.")
+
+    @viewRegistry.getView(this).getScrollHeight()
+
+  getScrollWidth: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getScrollWidth instead.")
+
+    @viewRegistry.getView(this).getScrollWidth()
+
+  getMaxScrollTop: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getMaxScrollTop instead.")
+
+    @viewRegistry.getView(this).getMaxScrollTop()
+
+  getVisibleRowRange: ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::getVisibleRowRange instead.")
+
+    @viewRegistry.getView(this).getVisibleRowRange()
+
+  intersectsVisibleRowRange: (startRow, endRow) ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::intersectsVisibleRowRange instead.")
+
+    @viewRegistry.getView(this).intersectsVisibleRowRange(startRow, endRow)
+
+  selectionIntersectsVisibleRowRange: (selection) ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::selectionIntersectsVisibleRowRange instead.")
+
+    @viewRegistry.getView(this).selectionIntersectsVisibleRowRange(selection)
+
+  screenPositionForPixelPosition: (pixelPosition) ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::screenPositionForPixelPosition instead.")
+
+    @viewRegistry.getView(this).screenPositionForPixelPosition(pixelPosition)
+
+  pixelRectForScreenRange: (screenRange) ->
+    Grim.deprecate("This is now a view method. Call TextEditorElement::pixelRectForScreenRange instead.")
+
+    @viewRegistry.getView(this).pixelRectForScreenRange(screenRange)
 
   ###
   Section: Utility
@@ -2793,3 +3141,26 @@ class TextEditor extends Model
     "<TextEditor #{@id}>"
 
   logScreenLines: (start, end) -> @displayBuffer.logLines(start, end)
+
+  emitWillInsertTextEvent: (text) ->
+    result = true
+    cancel = -> result = false
+    willInsertEvent = {cancel, text}
+    @emitter.emit 'will-insert-text', willInsertEvent
+    result
+
+  ###
+  Section: Language Mode Delegated Methods
+  ###
+
+  suggestedIndentForBufferRow: (bufferRow, options) -> @languageMode.suggestedIndentForBufferRow(bufferRow, options)
+
+  autoIndentBufferRow: (bufferRow, options) -> @languageMode.autoIndentBufferRow(bufferRow, options)
+
+  autoIndentBufferRows: (startRow, endRow) -> @languageMode.autoIndentBufferRows(startRow, endRow)
+
+  autoDecreaseIndentForBufferRow: (bufferRow) -> @languageMode.autoDecreaseIndentForBufferRow(bufferRow)
+
+  toggleLineCommentForBufferRow: (row) -> @languageMode.toggleLineCommentsForBufferRow(row)
+
+  toggleLineCommentsForBufferRows: (start, end) -> @languageMode.toggleLineCommentsForBufferRows(start, end)
